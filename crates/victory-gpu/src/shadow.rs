@@ -155,6 +155,66 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
+/// The smallest title buffer whose copy goes to the card's memory when the
+/// copy is made for a view shaders write through (an unordered access view
+/// being made or bound): `VICTORY_CARD_WRITTEN_MIN_MB`, unset by default
+/// (such copies then follow [`card_limits`] like any other, as before).
+///
+/// What stays in the PC's memory below 16 MiB is what the CPU snapshots
+/// and compares: in the gameplay frames of the 2026-11-25 run, 365 MB a
+/// frame in 341 ranges of title buffers' copies, 341 MB of it in copies of
+/// 1 MiB or more, for 100 ms of snapshots, 43 ms of compares and 26 ms of
+/// merging a frame, while the ten copies on the card (492 MB) had 729 MB a
+/// frame compared on the card for 7.5 ms of waits. Lowering the size for
+/// every copy (`VICTORY_CARD_BUFFERS_MIN_MB=1`) also spends the cap of
+/// [`card_limits`] on buffers shaders only read, made first; this spends it
+/// on those whose writes the CPU would otherwise look for. The copy is the
+/// same kind of card copy as a big one (`Host::card_before`,
+/// `Host::card_back`), with the same assumption ([`cards`]).
+fn card_written_least() -> Option<u64> {
+    static LEAST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LEAST.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WRITTEN_MIN_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| (mb << 20).max(1 << 20))
+    })
+}
+
+thread_local! {
+    /// Whether the copy asked for now is asked for by a view shaders write
+    /// through ([`for_writes`]).
+    static WRITTEN_ASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `ask` (which may make a title buffer's copy) as an ask for a view
+/// shaders write through: with [`card_written_least`], a copy made in it
+/// goes to the card's memory from that size on.
+pub(crate) fn for_writes<T>(ask: impl FnOnce() -> T) -> T {
+    if card_written_least().is_none() {
+        return ask();
+    }
+    let was = WRITTEN_ASK.with(|w| w.replace(true));
+    let out = ask();
+    WRITTEN_ASK.with(|w| w.set(was));
+    out
+}
+
+/// The smallest copy to go to the card's memory for an ask made now.
+fn card_least() -> u64 {
+    let least = card_limits().0;
+    match card_written_least() {
+        Some(written) if WRITTEN_ASK.with(|w| w.get()) => written.min(least),
+        _ => least,
+    }
+}
+
+/// Since the start: copies put in the card's memory below
+/// [`card_limits`]' size for a view shaders write through, and their bytes;
+/// copies big enough for the card's memory that stayed in the PC's (the
+/// cap of [`card_limits`] or the card's budget), and their bytes.
+static CARD_PLACES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -187,14 +247,15 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
-/// copy, if the copy is to be there: [`cards`] is on, the size is within
-/// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
+/// copy, if the copy is to be there: [`cards`] is on, the size is `least`
+/// ([`card_least`]) or more, within the cap of [`card_limits`] and below
+/// 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+fn card_for(size: u64, least: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
-    let (least, most) = card_limits();
+    let most = card_limits().1;
     if size < least || size >= 1 << 30 {
         return None;
     }
@@ -202,6 +263,20 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
+    let made = card_for_room(host, size, most);
+    if made.is_none() {
+        CARD_PLACES[2].fetch_add(1, Ordering::Relaxed);
+        CARD_PLACES[3].fetch_add(size, Ordering::Relaxed);
+    } else if size < card_limits().0 {
+        CARD_PLACES[0].fetch_add(1, Ordering::Relaxed);
+        CARD_PLACES[1].fetch_add(size, Ordering::Relaxed);
+    }
+    made
+}
+
+/// [`card_for`], once the copy is to go to the card: the buffer, if the
+/// card has room under the budget and under `most`.
+fn card_for_room(host: &crate::host::Host, size: u64, most: u64) -> Option<ID3D12Resource> {
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
     // the world loads, before the textures fill the card; the texture
@@ -2784,7 +2859,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        let least = card_least();
+        let big = cards() && size >= least;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -2793,7 +2869,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, card) = match card_for(size, least) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
