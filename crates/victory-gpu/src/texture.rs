@@ -56,6 +56,11 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Whether the buffer came from the pool (`crate::staging_pool`) and
+    /// still holds another texture's bytes: a fresh one is zeros, and what
+    /// is not detiled (memory all zero, a detiling that failed) is
+    /// uploaded as such, so zeros are written instead.
+    stale: std::sync::atomic::AtomicBool,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -387,6 +392,17 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // The last holder went, so no list names the buffer any more: the
+        // card is done with it.
+        if crate::staging_pool::on() {
+            crate::staging_pool::give(
+                crate::staging_pool::Kept {
+                    buffer: self.buffer.clone(),
+                    data: self.data as usize,
+                },
+                self.bytes,
+            );
+        }
     }
 }
 
@@ -697,7 +713,7 @@ impl Staging {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if read.iter().all(|&b| b == 0) && !self.stale.load(std::sync::atomic::Ordering::Relaxed) {
                     return false;
                 }
                 self.detile(read);
@@ -765,6 +781,10 @@ impl Staging {
             size
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
+            if self.stale.swap(false, Relaxed) {
+                // SAFETY: the whole mapped staging buffer.
+                unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
+            }
             last.asked = 0;
             0
         }
@@ -792,9 +812,14 @@ impl Staging {
             };
             if let Err(e) = detile_wide(&self.layout, tiled, mip, slice, linear, pitch, rows) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                if self.stale.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: the whole mapped staging buffer.
+                    unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
+                }
                 return;
             }
         }
+        self.stale.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1092,7 +1117,20 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    // With the pool on, a let-go buffer of about the size, or a new one made
+    // at the size's class so that it can stand in for others later.
+    let (buffer, data, bytes, stale) = match crate::staging_pool::take(total) {
+        Some((kept, capacity)) => (kept.buffer, kept.data as *mut u8, capacity, true),
+        None if crate::staging_pool::on() => {
+            let capacity = crate::staging_pool::class(total);
+            let (buffer, data) = host.upload_buffer(capacity)?;
+            (buffer, data, capacity, false)
+        }
+        None => {
+            let (buffer, data) = host.upload_buffer(total)?;
+            (buffer, data, total, false)
+        }
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1101,7 +1139,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -1111,12 +1149,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        bytes: total,
+        bytes,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        stale: std::sync::atomic::AtomicBool::new(stale),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

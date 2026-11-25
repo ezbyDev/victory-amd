@@ -691,6 +691,7 @@ fn log_memory() {
     let made: Vec<u64> = crate::host::MADE.iter().map(|m| m.load(Relaxed)).collect();
     let windows = crate::shadow::windows();
     let stagings = crate::texture::let_go();
+    let pool = crate::staging_pool::memory();
     let census = crate::resource::census();
     let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
     let card = crate::host::host()
@@ -747,12 +748,18 @@ fn log_memory() {
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
-         asked for in each",
+         asked for in each; staging pool: {} buffers kept {:.0} MB, {} taken from it, {} made \
+         anew, {} freed past its cap",
         windows[0],
         mb(windows[1]),
         stagings[0],
         mb(stagings[1]),
         mb(windows[2]),
+        pool[0],
+        mb(pool[1]),
+        pool[2],
+        pool[3],
+        pool[4],
     );
     tracing::info!(
         "memory: {:.0} MB private ({:.0} MB of it in memory; the PC has {:.0} MB free and {:.0} MB \
