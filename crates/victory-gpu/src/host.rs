@@ -1489,6 +1489,89 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// [`CARD_COMPARE`] with a group of 64 threads per piece
+/// ([`card_wide_hash`]): each thread hashes 1 KiB of the piece as
+/// [`CARD_COMPARE`] hashes a whole one, and the first folds the 64 hashes,
+/// in order, the same way. Another hash of the same bytes, as strong: a
+/// byte that changes changes its thread's hash, and the fold of hashes in
+/// order changes with any of them. The same shader makes the hashes kept
+/// and those compared with them, so the two always agree.
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 part[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 lane : SV_GroupThreadID) {
+    if (group.x >= pieces) return;
+    uint piece = first + group.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    // 1 KiB to a thread; the last takes the up to 16 bytes the widening
+    // adds past 64 KiB.
+    uint a = min(lo + lane.x * 1024u, hi);
+    uint b = lane.x == 63u ? hi : min(a + 1024u, hi);
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ lane.x;
+    [loop]
+    for (uint at = a; at < b; at += 16u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    part[lane.x] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (lane.x != 0u) return;
+    uint4 f = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint k = 0u; k < 64u; k++) {
+        f = (f ^ part[k]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        f = f.yzwx ^ (f >> 15);
+    }
+    if (compare != 0u) {
+        differs.Store(out_at + group.x * 4u, any(f != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        if (compare == 2u) hashes.Store4(piece * 16u, f);
+    } else {
+        hashes.Store4(piece * 16u, f);
+    }
+}
+"#;
+
+/// Whether our hash and compare passes over copies in the card's memory
+/// use [`CARD_COMPARE_WIDE`], a group of 64 threads to a piece
+/// (`VICTORY_CARD_WIDE_HASH=1`; off by default: [`CARD_COMPARE`], a thread
+/// to a piece, as before; read when the compare is made).
+///
+/// One thread walks a piece's 64 KiB 16 bytes at a time, 4,096 steps one
+/// after the other, so a pass takes the time of 4,096 dependent loads
+/// however many pieces it has, and the card runs few threads: the last
+/// run's ~11,000 pieces compared a frame in 13 passes are some 850 threads
+/// a pass, a few waves on a card of 32 compute units, each pass bound by
+/// one thread's walk. With 64 threads a piece walks 64 steps per thread
+/// and a fold of 64, and a pass is as many waves as it has pieces. The
+/// same pieces are hashed and flagged as before, so a fetch and a merge
+/// see what they saw (the merge compares bytes, not hashes).
+fn card_wide_hash() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_WIDE_HASH").is_some_and(|v| v == "1"))
+}
+
+/// Groups for a pass of our compare shader over `pieces` pieces.
+fn card_groups(pieces: u32) -> u32 {
+    if card_wide_hash() { pieces } else { pieces.div_ceil(64) }
+}
+
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
 /// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
@@ -2948,9 +3031,10 @@ impl Host {
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
+            let source = if card_wide_hash() { CARD_COMPARE_WIDE } else { CARD_COMPARE };
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -3116,7 +3200,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(card_groups(run.pieces), 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3201,7 +3285,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(card_groups(r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -5725,8 +5809,9 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes                      (VICTORY_CARD_WIDE_HASH=1, a group of 64 threads to a piece: now {})",
+                    if rehash_runs() { "on" } else { "off" },
+                    if card_wide_hash() { "on" } else { "off" }
                 );
             }
         }

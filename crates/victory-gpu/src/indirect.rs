@@ -720,6 +720,65 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The compare with a group to a piece (`VICTORY_CARD_WIDE_HASH`), on
+    /// the software adapter: a byte changed anywhere in a piece, in any
+    /// thread's kilobyte (the first, a middle one, the last byte of the
+    /// last), flags that piece and no other, with 1 and with 2 as the
+    /// compare of a thread to a piece does.
+    #[test]
+    fn warp_wide_card_compare_flags_the_piece_a_byte_changed_in() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE_WIDE).expect("the wide card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+            // SAFETY: as in the test above.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        assert_eq!(run(&mut warp, 0), [7, 7, 7]);
+        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        for (at, piece) in [(0usize, 0usize), (PIECE - 1, 0), (PIECE + 17 * 1024 + 5, 1), (3 * PIECE - 1, 2), (2 * PIECE + 1023, 2)] {
+            // SAFETY (each): inside the mapping.
+            let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+            let mut wanted = [0u32; 3];
+            wanted[piece] = 1;
+            set(content[at] ^ 0x40);
+            assert_eq!(run(&mut warp, 1), wanted, "byte {at}");
+            set(content[at]);
+            assert_eq!(run(&mut warp, 1), [0, 0, 0], "byte {at} back");
+            set(content[at] ^ 0x01);
+            assert_eq!(run(&mut warp, 2), wanted, "byte {at}, storing");
+            assert_eq!(run(&mut warp, 2), [0, 0, 0], "byte {at}, stored");
+            set(content[at]);
+            assert_eq!(run(&mut warp, 2), wanted, "byte {at} back, storing");
+            assert_eq!(run(&mut warp, 1), [0, 0, 0], "byte {at} back, stored");
+        }
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
