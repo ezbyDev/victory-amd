@@ -373,6 +373,8 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // With `one_wait`, the wait after the clamp goes; its state change stays.
+    let after = usize::from(!waits || one_wait());
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -386,9 +388,31 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[after..]);
     }
     true
+}
+
+/// Whether a bounded indirect command waits for every earlier shader write
+/// once, before our clamp, and not again after it
+/// (`VICTORY_INDIRECT_ONE_WAIT=1`; off by default: twice, as before).
+///
+/// Every bounded command was two such waits (1,729 bounded commands a
+/// frame in the last run, 3,458 waits, beside the title's own 745): each
+/// drains the card's shaders, and the card was busy 39% of a frame. The
+/// wait after the clamp orders only what the clamp wrote, as nothing else
+/// runs between the two waits: its arguments (`dst`) and the list's budget
+/// words. For `dst` the state change that stays (unordered access to
+/// indirect argument) makes the clamp's writes visible to the indirect
+/// read. The budget is read and written by the next clamp only (and by the
+/// CPU after the list ran), and the next clamp's own first wait orders it.
+/// The clamp's reads of the title's arguments and count are ordered before
+/// later writes to them by the state change as well: a legacy barrier is
+/// a dependency of all earlier work to all later work (D3D12 maps it to
+/// sync ALL before and after), which is all a write after a read needs.
+pub(crate) fn one_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_ONE_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
@@ -718,6 +742,65 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// The compare with a group to a piece (`VICTORY_CARD_WIDE_HASH`), on
+    /// the software adapter: a byte changed anywhere in a piece, in any
+    /// thread's kilobyte (the first, a middle one, the last byte of the
+    /// last), flags that piece and no other, with 1 and with 2 as the
+    /// compare of a thread to a piece does.
+    #[test]
+    fn warp_wide_card_compare_flags_the_piece_a_byte_changed_in() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE_WIDE).expect("the wide card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+            // SAFETY: as in the test above.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        assert_eq!(run(&mut warp, 0), [7, 7, 7]);
+        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        for (at, piece) in [(0usize, 0usize), (PIECE - 1, 0), (PIECE + 17 * 1024 + 5, 1), (3 * PIECE - 1, 2), (2 * PIECE + 1023, 2)] {
+            // SAFETY (each): inside the mapping.
+            let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+            let mut wanted = [0u32; 3];
+            wanted[piece] = 1;
+            set(content[at] ^ 0x40);
+            assert_eq!(run(&mut warp, 1), wanted, "byte {at}");
+            set(content[at]);
+            assert_eq!(run(&mut warp, 1), [0, 0, 0], "byte {at} back");
+            set(content[at] ^ 0x01);
+            assert_eq!(run(&mut warp, 2), wanted, "byte {at}, storing");
+            assert_eq!(run(&mut warp, 2), [0, 0, 0], "byte {at}, stored");
+            set(content[at]);
+            assert_eq!(run(&mut warp, 2), wanted, "byte {at} back, storing");
+            assert_eq!(run(&mut warp, 1), [0, 0, 0], "byte {at} back, stored");
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

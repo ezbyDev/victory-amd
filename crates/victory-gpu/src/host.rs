@@ -1438,7 +1438,41 @@ struct CardWork {
     taken: u32,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
+    /// With [`card_stamps`]: timestamps around our lists.
+    stamps: Option<CardStamps>,
 }
+
+/// Whether our own lists for copies in the card's memory (the sending up
+/// with its hash passes before a submission's lists, the compare after
+/// them) are timed on the card (`VICTORY_CARD_STAMPS=1`, diagnostics
+/// builds; off by default). Two timestamps per list, read when the plan is
+/// done (`Host::card_done`), summed for the frame line. Unlike
+/// `VICTORY_GPU_TIMING` nothing else changes: the lists go to the card as
+/// they do, and the title's lists are not timed. A timestamp is taken when
+/// the card gets to it, so a list's time may also hold the end of the work
+/// before it; the compare starts behind a wait for every shader write of
+/// the title's lists.
+fn card_stamps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_CARD_STAMPS").is_some_and(|v| v == "1"))
+}
+
+/// Plans whose timestamps are kept at once ([`card_stamps`]), four each.
+const CARD_STAMP_PLANS: u32 = 256;
+
+/// The timestamps of [`card_stamps`]: the heap, where they are resolved
+/// (read-back memory, mapped), and the next plan's place.
+struct CardStamps {
+    heap: ID3D12QueryHeap,
+    back: ID3D12Resource,
+    data: usize,
+    next: u32,
+}
+
+/// Since the last frame line, from [`card_stamps`]: microseconds of our
+/// sending-up lists on the card and how many, of our compare lists and how
+/// many.
+static CARD_STAMP_US: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
 // under the submission lock.
@@ -1493,6 +1527,89 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// [`CARD_COMPARE`] with a group of 64 threads per piece
+/// ([`card_wide_hash`]): each thread hashes 1 KiB of the piece as
+/// [`CARD_COMPARE`] hashes a whole one, and the first folds the 64 hashes,
+/// in order, the same way. Another hash of the same bytes, as strong: a
+/// byte that changes changes its thread's hash, and the fold of hashes in
+/// order changes with any of them. The same shader makes the hashes kept
+/// and those compared with them, so the two always agree.
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 part[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 lane : SV_GroupThreadID) {
+    if (group.x >= pieces) return;
+    uint piece = first + group.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    // 1 KiB to a thread; the last takes the up to 16 bytes the widening
+    // adds past 64 KiB.
+    uint a = min(lo + lane.x * 1024u, hi);
+    uint b = lane.x == 63u ? hi : min(a + 1024u, hi);
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ lane.x;
+    [loop]
+    for (uint at = a; at < b; at += 16u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    part[lane.x] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (lane.x != 0u) return;
+    uint4 f = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint k = 0u; k < 64u; k++) {
+        f = (f ^ part[k]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        f = f.yzwx ^ (f >> 15);
+    }
+    if (compare != 0u) {
+        differs.Store(out_at + group.x * 4u, any(f != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        if (compare == 2u) hashes.Store4(piece * 16u, f);
+    } else {
+        hashes.Store4(piece * 16u, f);
+    }
+}
+"#;
+
+/// Whether our hash and compare passes over copies in the card's memory
+/// use [`CARD_COMPARE_WIDE`], a group of 64 threads to a piece
+/// (`VICTORY_CARD_WIDE_HASH=1`; off by default: [`CARD_COMPARE`], a thread
+/// to a piece, as before; read when the compare is made).
+///
+/// One thread walks a piece's 64 KiB 16 bytes at a time, 4,096 steps one
+/// after the other, so a pass takes the time of 4,096 dependent loads
+/// however many pieces it has, and the card runs few threads: the last
+/// run's ~11,000 pieces compared a frame in 13 passes are some 850 threads
+/// a pass, a few waves on a card of 32 compute units, each pass bound by
+/// one thread's walk. With 64 threads a piece walks 64 steps per thread
+/// and a fold of 64, and a pass is as many waves as it has pieces. The
+/// same pieces are hashed and flagged as before, so a fetch and a merge
+/// see what they saw (the merge compares bytes, not hashes).
+fn card_wide_hash() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_WIDE_HASH").is_some_and(|v| v == "1"))
+}
+
+/// Groups for a pass of our compare shader over `pieces` pieces.
+fn card_groups(pieces: u32) -> u32 {
+    if card_wide_hash() { pieces } else { pieces.div_ceil(64) }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -1552,6 +1669,9 @@ struct CardPlan {
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
+    /// With [`card_stamps`]: the plan's first timestamp, and whether its
+    /// sending up and its compare were timed.
+    stamp: Option<(u32, bool, bool)>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2996,9 +3116,10 @@ impl Host {
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
+            let source = if card_wide_hash() { CARD_COMPARE_WIDE } else { CARD_COMPARE };
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -3040,7 +3161,32 @@ impl Host {
                 fetched: None,
                 taken: 0,
                 out: 0,
+                stamps: if card_stamps() { self.make_card_stamps() } else { None },
             })
+        }
+    }
+
+    /// [`CardStamps`], or `None` (and a warning) if the card has none.
+    fn make_card_stamps(&self) -> Option<CardStamps> {
+        let back = self.read_back_buffer(u64::from(CARD_STAMP_PLANS) * 4 * 8)?;
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain object creation; a read-back buffer mapped whole
+        // for reading, as long as it lives.
+        let made = unsafe {
+            self.device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: CARD_STAMP_PLANS * 4, NodeMask: 0 },
+                    &mut heap,
+                )
+                .and_then(|()| back.Map(0, None, Some(&mut data)))
+        };
+        match (made, heap) {
+            (Ok(()), Some(heap)) if !data.is_null() => Some(CardStamps { heap, back, data: data as usize, next: 0 }),
+            _ => {
+                tracing::warn!("VICTORY_CARD_STAMPS: no timestamps for our lists on the card");
+                None
+            }
         }
     }
 
@@ -3094,6 +3240,12 @@ impl Host {
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
+        let stamp = work.stamps.as_mut().map(|stamps| {
+            let at = stamps.next * 4;
+            stamps.next = (stamps.next + 1) % CARD_STAMP_PLANS;
+            at
+        });
+        let mut stamped = (false, false);
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -3122,6 +3274,9 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    if let (Some(stamps), Some(at)) = (&work.stamps, stamp) {
+                        list.EndQuery(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at);
+                    }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3164,8 +3319,13 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(card_groups(run.pieces), 1, 1);
                         }
+                    }
+                    if let (Some(stamps), Some(at)) = (&work.stamps, stamp) {
+                        list.EndQuery(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at + 1);
+                        list.ResolveQueryData(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at, 2, &stamps.back, u64::from(at) * 8);
+                        stamped.0 = true;
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -3183,6 +3343,7 @@ impl Host {
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
+            stamp: None,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3241,6 +3402,9 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    if let (Some(stamps), Some(at)) = (&work.stamps, stamp) {
+                        list.EndQuery(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at + 2);
+                    }
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
@@ -3249,8 +3413,13 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(card_groups(r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let (Some(stamps), Some(at)) = (&work.stamps, stamp) {
+                        list.EndQuery(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at + 3);
+                        list.ResolveQueryData(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at + 2, 2, &stamps.back, u64::from(at + 2) * 8);
+                        stamped.1 = true;
                     }
                     list.Close()?;
                     list.cast()
@@ -3262,6 +3431,7 @@ impl Host {
             }
             plan.lists.push((true, check));
         }
+        plan.stamp = stamp.map(|at| (at, stamped.0, stamped.1));
         work.out += 1;
         Some(plan)
     }
@@ -3286,6 +3456,20 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
+        if let (Some(stamps), Some((at, sync, check))) = (&work.stamps, plan.stamp) {
+            // SAFETY: a plain query.
+            let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0).max(1);
+            // SAFETY: the mapping holds every plan's four stamps; the
+            // plan's lists have run, so their resolves have.
+            let read = |i: u32| unsafe { (stamps.data as *const u64).add((at + i) as usize).read_volatile() };
+            let us = |a: u64, b: u64| b.saturating_sub(a).saturating_mul(1_000_000) / frequency;
+            for (timed, first, slot) in [(sync, 0u32, 0usize), (check, 2, 2)] {
+                if timed {
+                    CARD_STAMP_US[slot].fetch_add(us(read(first), read(first + 1)), Ordering::Relaxed);
+                    CARD_STAMP_US[slot + 1].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
@@ -5814,8 +5998,18 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes                      (VICTORY_CARD_WIDE_HASH=1, a group of 64 threads to a piece: now {})",
+                    if rehash_runs() { "on" } else { "off" },
+                    if card_wide_hash() { "on" } else { "off" }
+                );
+            }
+            let [sync_us, syncs, check_us, checks] = [0, 1, 2, 3].map(|i| CARD_STAMP_US[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if card_stamps() {
+                tracing::info!(
+                    "our lists for copies in the card's memory on the card's clock per frame (VICTORY_CARD_STAMPS): sending up and \
+                     hashing {:.2} ms in {syncs:.1} lists, comparing {:.2} ms in {checks:.1} lists",
+                    sync_us / 1e3,
+                    check_us / 1e3
                 );
             }
         }

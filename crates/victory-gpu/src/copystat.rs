@@ -1309,10 +1309,11 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each, one before it with VICTORY_INDIRECT_ONE_WAIT=1: now {}); barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        if crate::indirect::one_wait() { "on" } else { "off" },
         barrier_test()
     );
     // What is compared after submissions, largest first, and how much of
