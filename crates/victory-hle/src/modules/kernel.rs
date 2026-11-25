@@ -233,12 +233,14 @@ pub extern "system" fn OutputDebugStringW(text: *const u16) {
 /// the code and the caller, then exits on the host.
 pub extern "C" fn exit(code: i32) -> ! {
     tracing::warn!(code, from = %host::callers(), "title exits");
+    super::lifecycle::keep_pipelines("title exits");
     host::exit(code)
 }
 
 /// The CRT's `abort` (also reached from `terminate`): logged like [`exit`].
 pub extern "C" fn abort() -> ! {
     tracing::error!(from = %host::callers(), "title aborts");
+    super::lifecycle::keep_pipelines("title aborts");
     host::abort()
 }
 
@@ -246,12 +248,14 @@ pub extern "C" fn abort() -> ! {
 /// the host's `abort`.
 pub extern "C" fn terminate() -> ! {
     tracing::error!(from = %host::callers(), "title calls terminate");
+    super::lifecycle::keep_pipelines("title calls terminate");
     host::abort()
 }
 
 /// See [`terminate`].
 pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
     tracing::error!(from = %host::callers(), "title passed an invalid parameter");
+    super::lifecycle::keep_pipelines("title passed an invalid parameter");
     host::abort()
 }
 
@@ -266,6 +270,7 @@ pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
 
 extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     host::report_unhandled(info);
+    super::lifecycle::keep_pipelines("unhandled exception");
     match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         filter => {
@@ -281,6 +286,7 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
+        super::lifecycle::keep_pipelines("title terminates the process");
     }
     host::terminate_process(process, code)
 }

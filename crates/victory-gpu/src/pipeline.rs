@@ -766,6 +766,14 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// As [`save_pipeline_cache`], waiting `limit` at most (for ways out of the
+/// process where a save that hangs must not keep it alive); whether it
+/// finished.
+#[cfg(windows)]
+pub fn save_pipeline_cache_within(limit: std::time::Duration) -> bool {
+    library::save_within(limit)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]

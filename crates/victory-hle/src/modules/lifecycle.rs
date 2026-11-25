@@ -285,6 +285,22 @@ pub fn wait_for_previous() {
     }
 }
 
+/// Saves the compiled host pipelines on a way out of the process other
+/// than [`end`] (the title's own exit, abort or termination, a crash, a
+/// failure of the host GPU), waiting 10 s at most: the process is ending,
+/// and a save that hangs there (a lock the failing thread holds) must not
+/// keep it alive. Without it the pipelines made since the last save were
+/// lost, and the next run made them again.
+pub(crate) fn keep_pipelines(why: &str) {
+    #[cfg(windows)]
+    {
+        let saved = victory_gpu::pipeline::save_pipeline_cache_within(Duration::from_secs(10));
+        tracing::info!(saved, "{why}: pipeline library saved");
+    }
+    #[cfg(not(windows))]
+    let _ = why;
+}
+
 fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
