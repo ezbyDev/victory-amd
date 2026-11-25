@@ -1280,8 +1280,11 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// on the CPU (copies not in the card's memory): bytes snapshotted in
 /// windows outside buffers and in title buffers' copies; bytes compared in
 /// windows, in buffers' copies, and of those in copies of 1 MiB or more;
-/// ranges compared in windows and in buffers' copies.
-static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// ranges compared in windows and in buffers' copies; bytes compared in
+/// ranges of which nothing went back to title memory; bytes compared in
+/// buffers' copies big enough for the card's memory that stayed in the
+/// PC's ([`card_for`]: its cap or the card's budget).
+static BACK_CLASS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
@@ -1304,6 +1307,16 @@ pub(crate) fn back_line(frames: f64) {
         c[6],
         mb(c[1]),
         mb(c[4]),
+    );
+    let places: Vec<u64> = CARD_PLACES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "  of it per frame: {:.1} MB compared in ranges of which nothing went back to the title, {:.1} MB in copies big enough          for the card's memory that stayed in the PC's; since the start: {} copies {:.1} MB put in the card's memory for views          shaders write (VICTORY_CARD_WRITTEN_MIN_MB), {} copies {:.1} MB big enough that stayed in the PC's (VICTORY_CARD_BUFFERS_MB          or the card's budget)",
+        mb(c[7]),
+        mb(c[8]),
+        places[0],
+        mb(places[1] as f64),
+        places[2],
+        mb(places[3] as f64),
     );
 }
 
@@ -2050,6 +2063,18 @@ impl Shadow {
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
         if !self.window && self.len >= 1 << 20 {
             BACK_CLASS[4].fetch_add((to - from) as u64, Ordering::Relaxed);
+        }
+        if !self.window && cards() && self.len.next_multiple_of(PIECE as u64) >= card_limits().0 {
+            BACK_CLASS[8].fetch_add((to - from) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Offsets `[from, to)` were compared and `written` bytes of them went
+    /// back to title memory: for the frame line's counts.
+    pub(crate) fn wrote_back(&self, address: usize, len: usize, written: usize) {
+        if written == 0 {
+            let (from, to) = self.inside(address, len);
+            BACK_CLASS[7].fetch_add((to - from) as u64, Ordering::Relaxed);
         }
     }
 
