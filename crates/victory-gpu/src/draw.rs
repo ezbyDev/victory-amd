@@ -324,6 +324,94 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// Where the heap pass's time goes (diagnostics): the pass took 1,403 ms
+/// of a 1,867 ms world frame and nothing said which part. Microseconds per
+/// part since the last frame line, by [`HeapPart`]; then the texture slots
+/// looked at and the host views made for them.
+#[cfg(feature = "diagnostics")]
+static HEAP_SPLIT: [AtomicU64; HEAP_PARTS + 2] = [const { AtomicU64::new(0) }; HEAP_PARTS + 2];
+#[cfg(feature = "diagnostics")]
+const HEAP_PARTS: usize = 7;
+
+/// The parts of the heap pass timed apart.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+enum HeapPart {
+    /// Buffer slots: the host view of each and the copy it shows.
+    BufferSlots,
+    /// Bringing the buffer views' copies up to date.
+    BufferRefresh,
+    /// The texture queue: remapped slots, the slots due.
+    TextureQueue,
+    /// Whether a placed texture's memory is mapped (`mapped_bytes`).
+    TextureMapped,
+    /// The host view of a texture slot (`mirror`: the host texture made,
+    /// its descriptor written).
+    TextureMirror,
+    /// Recording the upload (`readable`: the staging buffer made).
+    TextureUpload,
+    /// The rest per texture slot: what is staged, the slot noted done.
+    TextureRest,
+}
+
+/// A stopwatch over the heap pass's parts; nothing without diagnostics.
+struct HeapLaps {
+    #[cfg(feature = "diagnostics")]
+    at: std::time::Instant,
+}
+
+impl HeapLaps {
+    fn new() -> Self {
+        HeapLaps {
+            #[cfg(feature = "diagnostics")]
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// The time since the last lap goes to `part`.
+    #[inline]
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    fn lap(&mut self, part: HeapPart) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let now = std::time::Instant::now();
+            HEAP_SPLIT[part as usize].fetch_add((now - self.at).as_micros() as u64, Ordering::Relaxed);
+            self.at = now;
+        }
+    }
+
+    /// Counts a texture slot looked at, and whether its host view was made.
+    #[inline]
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    fn slot(&self, mirrored: bool) {
+        #[cfg(feature = "diagnostics")]
+        HEAP_SPLIT[HEAP_PARTS + usize::from(mirrored)].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// For the frame line: the heap pass's split per frame over `frames`
+/// frames.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn heap_split(frames: f64) -> String {
+    let take = |i: usize| HEAP_SPLIT[i].swap(0, Ordering::Relaxed) as f64 / frames;
+    let parts = [
+        "buffer slots",
+        "buffer refresh",
+        "texture queue",
+        "texture mapped",
+        "texture views made",
+        "texture uploads recorded",
+        "texture rest",
+    ];
+    let mut line: Vec<String> = parts.iter().enumerate().map(|(i, p)| format!("{p} {:.1} ms", take(i) / 1e3)).collect();
+    let (passed, viewed) = (take(HEAP_PARTS), take(HEAP_PARTS + 1));
+    line.push(format!(
+        "{:.0} texture slots looked at, {viewed:.0} of them given a host view",
+        passed + viewed
+    ));
+    line.join(", ")
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1296,6 +1384,7 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
+        let mut laps = HeapLaps::new();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
@@ -1357,6 +1446,7 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        laps.lap(HeapPart::BufferSlots);
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1400,7 +1490,8 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
-        self.heap_textures(list, heap, host);
+        laps.lap(HeapPart::BufferRefresh);
+        self.heap_textures(list, heap, host, laps);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1440,6 +1531,7 @@ impl State {
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
+        mut laps: HeapLaps,
     ) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
@@ -1514,7 +1606,10 @@ impl State {
             value.and_then(|v| v.trim().parse().ok()).unwrap_or(250)
         }));
         let began = std::time::Instant::now();
+        laps.lap(HeapPart::TextureQueue);
         for (index, write) in due {
+            // What the slot before left after its last lap.
+            laps.lap(HeapPart::TextureRest);
             if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
@@ -1539,12 +1634,14 @@ impl State {
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
                     host.texture_slot_later(index, write, frame, most);
+                    laps.lap(HeapPart::TextureMapped);
                     continue;
                 }
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                         host.texture_slot_later(index, write, frame, most);
+                        laps.lap(HeapPart::TextureMapped);
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {
@@ -1553,6 +1650,7 @@ impl State {
                     partly = Some(mapped);
                 }
             }
+            laps.lap(HeapPart::TextureMapped);
             // A texture object the host renders to or writes holds the
             // host's own contents: nothing to bring up to date, and this
             // pass is no use of it (its host copy is made when something
@@ -1573,7 +1671,10 @@ impl State {
                 }
                 continue;
             }
+            laps.lap(HeapPart::TextureRest);
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            laps.lap(HeapPart::TextureMirror);
+            laps.slot(view.is_some());
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1592,9 +1693,11 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
+            laps.lap(HeapPart::TextureRest);
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
+            laps.lap(HeapPart::TextureUpload);
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)
