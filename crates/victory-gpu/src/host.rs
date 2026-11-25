@@ -1632,8 +1632,45 @@ impl Drop for Deferred {
         for (buffer, data, capacity) in self.pooled.drain(..) {
             crate::staging_pool::give(crate::staging_pool::Kept { buffer, data }, capacity);
         }
+        // Read backs are done once the list has run (`read_backs`), before
+        // this.
+        if readback_pool() && !self.backs.is_empty() {
+            let mut gone = Vec::new();
+            {
+                let mut pool = READBACK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+                for (buffer, _, _) in self.backs.drain(..) {
+                    // SAFETY: a live buffer.
+                    let capacity = unsafe { buffer.GetDesc() }.Width;
+                    gone.extend(pool.give(buffer, capacity, READBACK_MOST));
+                }
+            }
+            // Freed outside the lock.
+            drop(gone);
+        }
     }
 }
+
+/// Whether read-back buffers (texture to buffer copies the title reads,
+/// `Host::read_back_buffer`) are kept when the list that held them lets go
+/// of them, and handed to the next read back (`VICTORY_READBACK_POOL=1`;
+/// off by default: one committed resource per read back, freed at the
+/// list's reset, as before). A list holds its read-back buffers in
+/// `Deferred::backs` until it is reset after its last submission ran, and
+/// copies out of them once it has run, so the card is done with one given
+/// back. Same size classes and best fit as the staging pool; at most
+/// `READBACK_MOST` bytes kept.
+fn readback_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_some_and(|v| v == "1"))
+}
+
+static READBACK_POOL: Mutex<crate::staging_pool::Pool<ID3D12Resource>> = Mutex::new(crate::staging_pool::Pool::new());
+const READBACK_MOST: u64 = 256 << 20;
+
+/// Read-back buffers made since the start and their bytes, and those taken
+/// from [`READBACK_POOL`] instead (for the memory line: they were made per
+/// read back and counted nowhere).
+pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether host lists' own upload buffers (`HostList::upload`: texture
 /// data copied from title buffers; scratch past a chunk's 4 MiB) are taken
@@ -5615,6 +5652,15 @@ impl Host {
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        if readback_pool()
+            && let Some((buffer, _)) = READBACK_POOL.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+        {
+            READ_BACKS[2].fetch_add(1, Ordering::Relaxed);
+            return Some(buffer);
+        }
+        let size = if readback_pool() { crate::staging_pool::class(size) } else { size };
+        READ_BACKS[0].fetch_add(1, Ordering::Relaxed);
+        READ_BACKS[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
