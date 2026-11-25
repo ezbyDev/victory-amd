@@ -56,6 +56,11 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Whether the buffer came from the pool (`crate::staging_pool`) and
+    /// still holds another texture's bytes: a fresh one is zeros, and what
+    /// is not detiled (memory all zero, a detiling that failed) is
+    /// uploaded as such, so zeros are written instead.
+    stale: std::sync::atomic::AtomicBool,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -387,6 +392,17 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // The last holder went, so no list names the buffer any more: the
+        // card is done with it.
+        if crate::staging_pool::on() {
+            crate::staging_pool::give(
+                crate::staging_pool::Kept {
+                    buffer: self.buffer.clone(),
+                    data: self.data as usize,
+                },
+                self.bytes,
+            );
+        }
     }
 }
 
@@ -697,7 +713,7 @@ impl Staging {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if read.iter().all(|&b| b == 0) && !self.stale.load(std::sync::atomic::Ordering::Relaxed) {
                     return false;
                 }
                 self.detile(read);
@@ -765,6 +781,10 @@ impl Staging {
             size
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
+            if self.stale.swap(false, Relaxed) {
+                // SAFETY: the whole mapped staging buffer.
+                unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
+            }
             last.asked = 0;
             0
         }
@@ -792,9 +812,14 @@ impl Staging {
             };
             if let Err(e) = detile_wide(&self.layout, tiled, mip, slice, linear, pitch, rows) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                if self.stale.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: the whole mapped staging buffer.
+                    unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
+                }
                 return;
             }
         }
+        self.stale.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -994,18 +1019,125 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
+    mapped_bytes_now(at, len)
+}
+
+/// `VICTORY_MAPPED_BY_PAGE=1`: [`mapped_bytes`] by page.
+fn by_page() -> bool {
+    static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1"))
+}
+
+/// Whether [`mapped_bytes`] asks the kernel about all of a texture's 64 KiB
+/// blocks in one question (`VICTORY_MAPPED_BATCH=1`). Asked block by block
+/// it is one `QueryWorkingSetEx` per 64 KiB block, and two more for the
+/// first and last page: 258 kernel calls for a 16 MiB texture, every time
+/// the heap pass looks at its slot, in a pass that took 1,403 ms of a
+/// 1,867 ms world frame. The query takes up to 256 pages anywhere at once,
+/// so the first and last page go in one call and every block's first page
+/// in one call per 256 blocks (two calls for that texture); the answers
+/// are the same.
+fn mapped_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// Of `pages` (addresses), which can be read: one `QueryWorkingSetEx` per
+/// 256 of them, and a one-byte read through the kernel for those not in
+/// the working set, as [`readable`] does.
+fn pages_readable(pages: &[usize], there: &mut Vec<bool>) {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    there.clear();
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    for chunk in pages.chunks(info.len()) {
+        for (entry, &page) in info.iter_mut().zip(chunk) {
+            entry.VirtualAddress = page as *mut _;
+            // SAFETY: plain data.
+            entry.VirtualAttributes = unsafe { std::mem::zeroed() };
+        }
+        // SAFETY: `chunk.len()` entries of the size given; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (chunk.len() * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for (entry, &page) in info.iter().zip(chunk) {
+            // Bit 0 of the answer: the page is in the working set.
+            // SAFETY: plain data the query filled in.
+            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let mut byte = [0u8];
+            there.push(valid || crate::host::read_into(page as *const u8, &mut byte));
+        }
+    }
+}
+
+/// [`mapped_bytes`] by 64 KiB block with the questions batched
+/// ([`mapped_batch`]): none if neither the first nor the last byte is
+/// there, else the bytes of the blocks whose first page (cut to the range)
+/// is.
+fn mapped_blocks(start: usize, end: usize) -> u64 {
+    const BLOCK: usize = 64 << 10;
+    thread_local! {
+        static ASKED: std::cell::RefCell<(Vec<usize>, Vec<bool>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    ASKED.with_borrow_mut(|(pages, there)| {
+        // The ends first: a texture that is away (most slots looked at)
+        // is answered by them, without a failed read for each block.
+        pages.clear();
+        pages.push(start);
+        pages.push(end - 1);
+        pages_readable(pages, there);
+        if !there[0] && !there[1] {
+            return 0;
+        }
+        pages.clear();
+        let mut block = start & !(BLOCK - 1);
+        while block < end {
+            pages.push(block.max(start));
+            block = block.saturating_add(BLOCK);
+        }
+        pages_readable(pages, there);
+        mapped_from(start, end, BLOCK, there)
+    })
+}
+
+/// The bytes of `[start, end)` in the `BLOCK`-aligned blocks whose answer
+/// in `there` (one per block, in order) is yes.
+fn mapped_from(start: usize, end: usize, block_size: usize, there: &[bool]) -> u64 {
+    let mut bytes = 0u64;
+    let mut block = start & !(block_size - 1);
+    for &yes in there {
+        if block >= end {
+            break;
+        }
+        let (lo, hi) = (block.max(start), block.saturating_add(block_size).min(end));
+        if yes {
+            bytes += (hi - lo) as u64;
+        }
+        block = block.saturating_add(block_size);
+    }
+    bytes
+}
+
+fn mapped_bytes_now(at: *const u8, len: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
     let end = start.saturating_add(len);
+    if mapped_batch() && !by_query() && !by_page() {
+        return mapped_blocks(start, end);
+    }
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
     if !by_query() {
-        static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+        if by_page() {
             // By page, without the walk: whole pages, cut to the range.
             let (there, _) = readable(start, len, false);
             return (there as u64 * 4096).min(len as u64);
@@ -1092,7 +1224,20 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    // With the pool on, a let-go buffer of about the size, or a new one made
+    // at the size's class so that it can stand in for others later.
+    let (buffer, data, bytes, stale) = match crate::staging_pool::take(total) {
+        Some((kept, capacity)) => (kept.buffer, kept.data as *mut u8, capacity, true),
+        None if crate::staging_pool::on() => {
+            let capacity = crate::staging_pool::class(total);
+            let (buffer, data) = host.upload_buffer(capacity)?;
+            (buffer, data, capacity, false)
+        }
+        None => {
+            let (buffer, data) = host.upload_buffer(total)?;
+            (buffer, data, total, false)
+        }
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1101,7 +1246,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -1111,15 +1256,36 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        bytes: total,
+        bytes,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        stale: std::sync::atomic::AtomicBool::new(stale),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod mapped_tests {
+    use super::mapped_from;
+
+    const B: usize = 64 << 10;
+
+    /// The batched answer counts the bytes of the range in each block that
+    /// is there, as the block-by-block loop does.
+    #[test]
+    fn blocks_there_count_their_part_of_the_range() {
+        // A range from the middle of block 1 to the middle of block 4.
+        let (start, end) = (B + B / 2, 4 * B + 100);
+        assert_eq!(mapped_from(start, end, B, &[true; 4]), (end - start) as u64);
+        assert_eq!(mapped_from(start, end, B, &[true, false, false, false]), (B / 2) as u64);
+        assert_eq!(mapped_from(start, end, B, &[false, true, true, false]), (2 * B) as u64);
+        assert_eq!(mapped_from(start, end, B, &[false, false, false, true]), 100);
+        assert_eq!(mapped_from(start, end, B, &[false; 4]), 0);
+    }
 }
 
 #[cfg(test)]
