@@ -133,12 +133,45 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Recording by part ([`timed`]): draws, dispatches and indirect
+    /// executions recorded and their nanoseconds; and within them, the
+    /// nanoseconds of the descriptor tables (and of the texture uploads
+    /// those ask for), of title memory by address, root views (the heap
+    /// pass included), root unordered access views, vertex and index
+    /// buffers, and the target and depth states. Then render targets set.
+    RecDraws,
+    RecDrawNs,
+    RecTablesNs,
+    RecTexUploadNs,
+    RecMemoryNs,
+    RecRootViewsNs,
+    RecRootUavsNs,
+    RecBuffersNs,
+    RecStatesNs,
+    RecTargetsNs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Adds the nanoseconds until it is dropped to counter `c` (a part of
+/// recording). Two clock reads: some 50 ns, against 49-120 us a list call.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timed(c: C) -> Timed {
+    Timed(c as usize, std::time::Instant::now())
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) struct Timed(usize, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Timed {
+    fn drop(&mut self) {
+        COUNT[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
+    }
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -1117,6 +1150,22 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PaceUs as usize]),
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
+    );
+    // The same list calls by part (builds with diagnostics), to see what a
+    // call's 49-120 us go to.
+    tracing::info!(
+        "recording by part per frame: {:.0} draws and dispatches {:.1} ms, the other list calls          {:.1} ms; in the draws: tables {:.1} ms (texture uploads {:.1} ms of it), title memory          by address {:.1} ms, root views {:.1} ms (the heap pass in it), root unordered views          {:.1} ms, vertex and index buffers {:.1} ms, target and depth states {:.1} ms; render          targets set {:.1} ms",
+        c[C::RecDraws as usize],
+        c[C::RecDrawNs as usize] / 1e6,
+        (c[C::RecordNs as usize] - c[C::RecDrawNs as usize]).max(0.0) / 1e6,
+        c[C::RecTablesNs as usize] / 1e6,
+        c[C::RecTexUploadNs as usize] / 1e6,
+        c[C::RecMemoryNs as usize] / 1e6,
+        c[C::RecRootViewsNs as usize] / 1e6,
+        c[C::RecRootUavsNs as usize] / 1e6,
+        c[C::RecBuffersNs as usize] / 1e6,
+        c[C::RecStatesNs as usize] / 1e6,
+        c[C::RecTargetsNs as usize] / 1e6,
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
