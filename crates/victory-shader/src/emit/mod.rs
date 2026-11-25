@@ -322,7 +322,15 @@ pub fn emit(
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    // A host whose widest wave is 64 (RDNA) runs a console wave64 program as one wave of its
+    // own, so the forms below that split a console wave across two host waves of 32 were
+    // never made for it. The first two are not such forms: they only change the program (its
+    // early-outs left out, its skips left out), which is what keeps lanes from running the
+    // cross-lane code, and that is exact on a wave of any width. They run on a 64-lane host
+    // too; the rest stay for a host of 32-lane waves.
+    let narrow = lower::host_max_wave() == 32;
+    let wide = lower::host_max_wave() >= 64;
+    if stuck && native.stage == HwStage::Cs && native.wave64 && (narrow || wide) {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -332,7 +340,10 @@ pub fn emit(
                 }
             }
         };
-        let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // A program that still needs 64 lanes is done on a host whose waves are 64 lanes.
+        let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| {
+            matches!(r, Ok((_, wave)) if *wave != Some(64) || wide)
+        };
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -383,6 +394,10 @@ pub fn emit(
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
+            // Each form below splits a console wave across two host waves of 32.
+            if !narrow {
+                break;
+            }
             if !exact {
                 // Before anything approximate, the exact forms that cost group barriers.
                 // Every skip left out that the code after it cannot see
@@ -442,7 +457,7 @@ pub fn emit(
                 }
             }
         }
-        if local_on && !exact_only {
+        if narrow && local_on && !exact_only {
             // Last: every mask and lane read per host wave.
             if !strict {
                 for (name, f) in &forms {

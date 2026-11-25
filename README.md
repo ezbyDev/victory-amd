@@ -75,6 +75,14 @@ breadcrumbs (DRED), one change per run.
   Windows resets it; capped at 1,024 iterations.
 - **Tooling traps** that make runs misleading: logging the title's output through PowerShell
   stalls the title, and settings left in a window change the next test.
+- **Cross-lane retries that never ran on AMD:** the translator retries a compute program
+  stopped "where not every lane runs" by leaving out its early-outs and its skips, and accepts
+  the result if the program no longer needs 64 lanes. That whole ladder was gated on a host
+  whose widest wave is 32 lanes, which is what NVIDIA reports: RDNA reports 32 to 64, so on
+  this card the gate never opened and such a program stayed dropped for the whole run. The two
+  forms that only change the program are exact on a wave of any width, and now run there too.
+  One compute program (`b22a16a178976e1b`, 14 dispatches a frame) went from refused to
+  validated at 64-lane waves offline.
 
 **Confirmed here, after reports by other testers:**
 - The submission relay thread (`VICTORY_RELAY`), which NVIDIA setups turn on, loses the
