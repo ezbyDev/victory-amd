@@ -997,7 +997,7 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
+            list.used_pipeline(p.pso.as_raw() as usize, &p.name);
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
             list.keep(&p.root);
@@ -1856,7 +1856,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                crate::pipeline::note_known(crate::pipeline::Why::Builder);
                 self.list_dropped_roots([x, y, z]);
             }
             return;

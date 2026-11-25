@@ -734,6 +734,11 @@ pub(crate) struct HostList {
     prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The host pipeline objects whose names are in `pipelines`: a pipeline
+    /// bound again is known by its pointer, not by comparing its name
+    /// (two shader hashes and more) with the names in the set. The list
+    /// holds each until its reset, so no other takes its address meanwhile.
+    pipeline_ids: Mutex<std::collections::HashSet<usize>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -2913,6 +2918,7 @@ impl Host {
                 twins: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
+                pipeline_ids: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
@@ -4519,6 +4525,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pipeline_ids.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -4945,8 +4952,12 @@ impl HostList {
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
-    /// Notes a pipeline the list binds.
-    pub(crate) fn used_pipeline(&self, name: &str) {
+    /// Notes a pipeline the list binds: `pso`, the host pipeline object the
+    /// list keeps (`HostList::keep`), named `name`.
+    pub(crate) fn used_pipeline(&self, pso: usize, name: &str) {
+        if !self.pipeline_ids.lock().unwrap_or_else(|e| e.into_inner()).insert(pso) {
+            return;
+        }
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());

@@ -16,6 +16,10 @@ use crate::host::host;
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    /// The shader-visible start ([`HostHeap::gpu_handle`]): fixed for the
+    /// heap's life, asked of the host once instead of for every table a
+    /// draw binds.
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -622,6 +626,7 @@ impl HostHeap {
         let h = HostHeap {
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -1205,10 +1210,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 

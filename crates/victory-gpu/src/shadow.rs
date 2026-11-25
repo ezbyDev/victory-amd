@@ -2755,10 +2755,20 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// A read-write lock: every vertex and index buffer, root view and buffer
+/// view of every draw is looked up here ([`lookup`]), on the title's six
+/// recording threads at once, and nearly every lookup finds a copy made
+/// already; only buffers made and released by the title, and copies made
+/// on first use, change the map.
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// [`buffers`] for looking only.
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -2781,7 +2791,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -2825,7 +2835,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
@@ -2865,6 +2875,25 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    // The buffer found with its copy made, as for nearly every ask: under
+    // the shared lock. Anything else (no buffer, a copy to make) goes the
+    // way it went, under the exclusive lock, and is looked for again there.
+    {
+        let map = buffers_read();
+        let found = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end);
+        match found {
+            Some((_, entry)) if entry.shadow.is_some() => return entry.shadow.clone(),
+            Some(_) => {}
+            None => {
+                drop(map);
+                return loose(address, end, len <= 1, any);
+            }
+        }
+    }
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
@@ -3259,7 +3288,7 @@ mod window_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
