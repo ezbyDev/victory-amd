@@ -561,14 +561,37 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// One save at a time, from serialising the library into its temporary
+/// file to the renames. Two saves could overlap there: one renamed the
+/// temporary file over the library while the other had just truncated it
+/// and was serialising into it (a worker's save and the one at the end of
+/// the run, or two workers' when serialising took longer than
+/// `SAVE_EVERY`). The next start then found the second save's bytes in
+/// part, which the host rejects: it started an empty library and made
+/// every pipeline again.
+static SAVE_FILE: Mutex<()> = Mutex::new(());
+
+/// When a save last started (`now`, or after `SAVE_EVERY`).
+static LAST_SAVE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and `SAVE_EVERY` has passed (or `now`). Without `now` it gives
+/// way to a save under way; with `now` it waits for it, then saves what
+/// was added since.
 pub(crate) fn save(now: bool) {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let _one = if now {
+        SAVE_FILE.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match SAVE_FILE.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    };
     {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }
