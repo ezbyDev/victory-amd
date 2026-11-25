@@ -101,6 +101,32 @@ whole range on the CPU to find what changed: 727 MB compared for 25 MB written b
    only differing pieces.
 3. Lazy copy-back: guard the pages; copy back on the CPU's first touch.
 
+Where it stands (2026-11-25): the 727 MB was mostly compared on the card already (the 174 MB
+heap and nine other copies of 16 MiB or more). What the CPU compares is 365 MB a frame in
+copies under 16 MiB. `VICTORY_CARD_WRITTEN_MIN_MB=1` puts copies made for unordered access
+views on the card from 1 MiB (raise `VICTORY_CARD_BUFFERS_MB`, the 512 MB cap is nearly
+full); `VICTORY_KEEP_SNAPSHOTS=1` retakes only the pieces of a snapshot that changed, with
+the same assumption the card copies make.
+
+Lazy copy-back (step 3) is not built, because it cannot be made safe with the hooks we have:
+- Without a snapshot it is wrong: the title's threads write other bytes of the same pages
+  while the card runs, and only the bytes from before tell their writes from the card's.
+  So it can only defer the compare and the merge, and it still needs the pages made
+  no-access to catch the first touch.
+- A no-access page is not caught by everything that reads it. Kernel reads of title
+  memory fail instead of faulting, and nothing hooks them: our own `read_into`
+  (`ReadProcessMemory`) under every refresh, texture hash and merge, `write_mapped`, and the
+  title's own writes to files from that memory. They would give zeros or "unmapped" without
+  an error.
+- The card reads title memory in place (placed textures, `VICTORY_INPLACE`) with no fault,
+  so the next submission could see the card's results missing.
+- `title_memory_remapped` resets protections, so a later read would see stale bytes
+  silently.
+- A read fault would have to merge inside the exception handler, on any thread, possibly
+  while that thread holds the locks the merge needs.
+
+So the CPU compare goes away by moving copies to the card (step 2), not by guarding pages.
+
 Check: `snapshots` and `compared back` near zero; "copying back" falls; nothing renders
 differently.
 
