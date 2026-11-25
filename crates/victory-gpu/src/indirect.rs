@@ -373,6 +373,8 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // With `one_wait`, the wait after the clamp goes; its state change stays.
+    let after = usize::from(!waits || one_wait());
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -386,9 +388,31 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[after..]);
     }
     true
+}
+
+/// Whether a bounded indirect command waits for every earlier shader write
+/// once, before our clamp, and not again after it
+/// (`VICTORY_INDIRECT_ONE_WAIT=1`; off by default: twice, as before).
+///
+/// Every bounded command was two such waits (1,729 bounded commands a
+/// frame in the last run, 3,458 waits, beside the title's own 745): each
+/// drains the card's shaders, and the card was busy 39% of a frame. The
+/// wait after the clamp orders only what the clamp wrote, as nothing else
+/// runs between the two waits: its arguments (`dst`) and the list's budget
+/// words. For `dst` the state change that stays (unordered access to
+/// indirect argument) makes the clamp's writes visible to the indirect
+/// read. The budget is read and written by the next clamp only (and by the
+/// CPU after the list ran), and the next clamp's own first wait orders it.
+/// The clamp's reads of the title's arguments and count are ordered before
+/// later writes to them by the state change as well: a legacy barrier is
+/// a dependency of all earlier work to all later work (D3D12 maps it to
+/// sync ALL before and after), which is all a write after a read needs.
+pub(crate) fn one_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_ONE_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
