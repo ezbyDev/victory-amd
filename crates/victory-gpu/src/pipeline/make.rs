@@ -91,6 +91,13 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// Whether `p` is still being made: [`missing`]'s "being made", without
+/// the text (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn being_made(p: &Pending) -> bool {
+    p.made.get().is_none()
+}
+
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 

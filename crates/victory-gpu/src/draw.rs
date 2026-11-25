@@ -1721,7 +1721,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                crate::pipeline::note_known(crate::pipeline::Why::Builder);
                 self.list_dropped_roots([x, y, z]);
             }
             return;

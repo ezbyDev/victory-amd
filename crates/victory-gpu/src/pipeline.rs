@@ -457,17 +457,48 @@ pub(crate) fn is_skipped(this: This) -> bool {
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_drop(this: This) {
-    let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
-    } else {
-        let p = pipeline(this);
-        skipped_shader(&p.shaders)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
-    };
-    if let Some(why) = why {
+    if this.is_null() {
+        note_known(Why::NoPipeline);
+        return;
+    }
+    let p = pipeline(this);
+    if let Some(hash) = skipped_shader(&p.shaders) {
+        note_why(format!("skipped shader {hash}"));
+    } else if make::being_made(&p.host) {
+        note_known(Why::BeingMade);
+    } else if let Some(why) = make::missing(&p.host) {
         note_why(why);
     }
+}
+
+/// The reasons drops are counted for most often, each in a counter of its
+/// own: a text made and a lock taken for every dropped draw was the cost
+/// of each (776 dropped stages of the ray-tracing structure builder a world
+/// frame). Their texts, as the other reasons', reach [`take_drops`].
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy)]
+pub(crate) enum Why {
+    Builder,
+    BeingMade,
+    NoPipeline,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+const WHY_TEXT: [&str; 3] = [
+    "a stage of the ray-tracing structure builder, which is off",
+    "being made",
+    "no pipeline set",
+];
+
+#[cfg(all(windows, feature = "diagnostics"))]
+static WHY_COUNT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Counts a draw or dispatch dropped for a reason of [`Why`] (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_known(why: Why) {
+    let text = WHY_TEXT[why as usize];
+    crate::capture::op(0, || format!("DROPPED {text}"));
+    WHY_COUNT[why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
@@ -482,7 +513,14 @@ pub(crate) fn note_why(why: String) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
+    let mut drops = drops.unwrap_or_default();
+    for (text, count) in WHY_TEXT.iter().zip(&WHY_COUNT) {
+        let n = count.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            *drops.entry((*text).to_owned()).or_default() += n;
+        }
+    }
+    let mut drops: Vec<(String, u64)> = drops.into_iter().collect();
     // Frame reports only show the first 40 reasons. Keep ties ordered so
     // a HashMap iteration order change cannot change which reasons appear.
     drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
