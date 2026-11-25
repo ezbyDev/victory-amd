@@ -25,7 +25,7 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    made: std::sync::RwLock<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -626,7 +626,7 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: std::sync::RwLock::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -856,7 +856,7 @@ impl HostHeap {
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
         if made.get(index as usize).is_none_or(|&key| key == 0) {
             return false;
         }
@@ -1257,7 +1257,20 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // The slot made from this record already, as it is for nearly every
+        // table entry a draw reads: nothing to change, under a shared lock.
+        // The lock is the heap's, which every recording thread and every
+        // descriptor the title writes needs: taken whole for each lookup,
+        // the six recording threads stood in line for it entry by entry.
+        if tag == VIEW_TAG {
+            let made = self.made.read().unwrap_or_else(|e| e.into_inner());
+            if made[index as usize] == key
+                && let Some(view) = view_at(i, generation)
+            {
+                return Some(view);
+            }
+        }
+        let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -1334,7 +1347,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = *self.made.read().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         if key == 0 {
             return Some("null".into());
         }
