@@ -127,6 +127,35 @@ time per pass (`VICTORY_GPU_TIMING`), and cut the heaviest of our own passes.
 Upload tiled bytes as-is and detile in a compute shader (`victory-formats` layouts). Only
 once stages 0–3 are in: textures are no longer the top cost (61 ms).
 
+## Status (2026-11-25, branch `perf/combined`)
+
+Measured: the remap-lock fix (`4bece45`) and stage 0 settings: world frame median
+1,867 → 534 ms (0.5 → 1.9 fps), card busy 9 → 39 %, 2.7× the draws.
+
+Built and unit-tested, **not yet measured in a run** (all default off unless noted):
+
+| Switch | Stage | What |
+|---|---|---|
+| `VICTORY_STAGING_POOL=1` (`_MB`, default 1024) | 1 | texture upload buffers reused |
+| `VICTORY_UPLOAD_RING=1` | 1 | host lists' upload buffers through the same pool |
+| `VICTORY_LIST_ARENA=1` | 1 | list upload blocks of 64 KiB+ reused |
+| `VICTORY_READBACK_POOL=1` | 1 | read-back buffers reused |
+| `VICTORY_MAPPED_BATCH=1` | 1 | `mapped_bytes` asks the kernel once per 256 blocks |
+| `VICTORY_HEAP_SLOTS_BATCH=1` | 1 | heap pass makes buffer views 64 at a time under one lock |
+| `VICTORY_CARD_WRITTEN_MIN_MB=1` (+ `VICTORY_CARD_BUFFERS_MB=1536`) | 2 | buffers shaders write compared on the card from 1 MiB |
+| `VICTORY_WIDE_BACK_MERGE=1` | 2 | shader-write merges on the kept threads |
+| `VICTORY_CARD_WIDE_HASH=1` | 5 | card compares: 64 threads a piece instead of one |
+| `VICTORY_INDIRECT_ONE_WAIT=1` | 5 | one shader-write drain per bounded indirect command, not two |
+| `VICTORY_CARD_STAMPS=1` | — | our own card work on the card's clock (log only) |
+| always on | 4 | shared locks: view table, made slots, buffer map; one host-copy lookup per state change; no per-draw Vec in `bind`; capture ops free without a capture; cached heap GPU handle; drop reasons counted in atomics; pipelines known by pointer |
+
+New log lines: `heap pass per frame: …`, `copystat: recording by part per frame`, the
+pools on `memory let go since the start:`, `our lists for copies in the card's memory on
+the card's clock`, and the submission-lock split.
+
+Test launcher: `C:\Users\david\Tools\vamd-perf\run-perf.ps1` (every switch above on). If
+a run loses the device or renders wrong, turn the stage 5 and stage 2 switches off first.
+
 ## Reading a run
 
 ```bash
