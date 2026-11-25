@@ -6,12 +6,14 @@ In order. Each item says how to check it.
    `VICTORY_PIPELINE_WAIT_MS=2000` and `VICTORY_PIPELINE_WORKERS=7`, judged on a warm second
    run. If still missing, the log's `dropped ... without a host pipeline` lines name the
    shaders; fix their translation.
-2. **Keep built pipelines after a crash.** The pipeline library is saved periodically and on
-   a normal exit; a crashed run loses its work (library stayed ~1 MB). Check: the backlog
-   ("being made") at the start of the next run.
-3. **Frame rate (1–3 fps).** About 150–230 ms a frame is copy-back. Try
-   `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_WIDE_BACK=1`,
-   one at a time; watch for device loss on AMD.
+2. **Mesh pipelines the library will not load back** ("the library did not load it: the
+   parameter is incorrect"): made again every run (0.2–0.4 ms each). The library now saves
+   every 60 s and on the ways out of the process, and says when a save failed.
+3. **Frame rate: 430 ms a world frame (2.3 fps, best 3.3).** Plan and measurements in
+   `docs/perf-plan.md`; settings in `scripts/run-amd.ps1`. Next: descriptor tables per draw
+   (186–198 ms a frame across the recording threads, ~70 % of recording), our card
+   compares (51 ms of card time a frame), the submitting thread's preparing + copy-back in
+   series (165 + 65 ms), then the shader optimiser back on (item 6) for the card's own work.
 4. **Purple / over-bright materials and foliage.** Likely ray-traced resolve shaders with
    incomplete input; find the program writing out-of-range values (skip one family at a
    time).

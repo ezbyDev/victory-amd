@@ -15,11 +15,27 @@ Remove-Item Env:VICTORY_RELAY -ErrorAction SilentlyContinue   # the relay thread
 $env:VICTORY_LATE_WAIT          = "3"      # submissions sent ahead of the wait for the card
 $env:VICTORY_SHADER_OPT         = "11"     # clean-up pass 4 off: it crashes AMD's shader compiler
 $env:VICTORY_SHADER_LOOP_LIMIT  = "1024"   # a translated loop cannot run until Windows resets the GPU
-$env:VICTORY_D3D12_DRED         = "1"      # a GPU failure names the commands in flight (crashes.log)
+# $env:VICTORY_D3D12_DRED       = "1"      # crash hunts only: names the commands in flight, ~300 ms a frame
 $env:VICTORY_TEXTURE_QUEUE_MB   = "1024"   # textures picked by index arrive in seconds
-$env:VICTORY_TEXTURE_QUEUE_MS   = "1000"
+$env:VICTORY_TEXTURE_QUEUE_MS   = "150"    # at most this long a pass making them (1000 made frames take seconds)
 $env:VICTORY_PIPELINE_WORKERS   = "6"      # build pipelines fast enough for scenes to appear
 $env:VICTORY_PIPELINE_PRIORITY  = "normal"
+
+# --- Speed (docs/perf-plan.md; measured on an RX 9060 XT: 1,867 -> 430 ms a world frame) ---
+$env:VICTORY_WIDE_BACK          = "1"      # snapshots and compares of shader writes on several threads
+$env:VICTORY_WIDE_BACK_MERGE    = "1"      # and their merges
+$env:VICTORY_KEEP_SNAPSHOTS     = "1"      # snapshots retake only the pieces that changed
+$env:VICTORY_KEEP_SNAPSHOTS_MB  = "512"
+$env:VICTORY_STAGING_POOL       = "1"      # upload buffers reused (page faults 69k -> 10k a frame)
+$env:VICTORY_UPLOAD_RING        = "1"
+$env:VICTORY_LIST_ARENA         = "1"
+$env:VICTORY_READBACK_POOL      = "1"
+$env:VICTORY_MAPPED_BATCH       = "1"      # fewer kernel queries in the heap pass
+$env:VICTORY_HEAP_SLOTS_BATCH   = "1"
+$env:VICTORY_CARD_WRITTEN_MIN_MB = "1"     # buffers shaders write compared on the card from 1 MiB
+$env:VICTORY_CARD_BUFFERS_MB    = "1536"
+$env:VICTORY_CARD_WIDE_HASH     = "1"      # card compares: 64 threads a piece
+# Not VICTORY_INDIRECT_ONE_WAIT: it hung the card on an RX 9060 XT.
 
 # Compute programs that crash AMD's shader compiler on every setting (c1eee35d, f1687692),
 # page-fault on AMD (eeed82b8, 02384a60), or never finish compiling (39f0e9ae).
