@@ -782,7 +782,7 @@ fn log_memory() {
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
          asked for in each; upload pool (staging; list uploads with VICTORY_UPLOAD_RING=1): {} buffers kept {:.0} MB, {} taken from it, {} made \
-         anew, {} freed past its cap",
+         anew, {} freed past its cap; read-back buffers: {} made {:.0} MB, {} taken from their pool          (VICTORY_READBACK_POOL=1)",
         windows[0],
         mb(windows[1]),
         stagings[0],
@@ -793,6 +793,9 @@ fn log_memory() {
         pool[2],
         pool[3],
         pool[4],
+        crate::host::READ_BACKS[0].load(Relaxed),
+        mb(crate::host::READ_BACKS[1].load(Relaxed)),
+        crate::host::READ_BACKS[2].load(Relaxed),
     );
     tracing::info!(
         "memory: {:.0} MB private ({:.0} MB of it in memory; the PC has {:.0} MB free and {:.0} MB \

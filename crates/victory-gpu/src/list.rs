@@ -114,7 +114,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    uploads: std::sync::Mutex<Vec<Block>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -199,7 +199,7 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 #[cfg(windows)]
 pub(crate) struct Detached {
     host: crate::host::HostList,
-    _uploads: Vec<Vec<u8>>,
+    _uploads: Vec<Block>,
     _state: crate::draw::State,
 }
 
@@ -1415,6 +1415,68 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
     reset(this, allocator, pipeline)
 }
 
+/// Memory [`allocate_upload`] handed out, freed where the list lets go of
+/// it (its reset, or the end of its submission's run), or with
+/// [`list_arena`] kept for the next such call.
+pub(crate) struct Block(Vec<u8>);
+
+/// Whether blocks of [`allocate_upload`] of 64 KiB or more are kept when
+/// the list lets go of them and handed to the next call
+/// (`VICTORY_LIST_ARENA=1`; off by default: a new zeroed vector per call,
+/// as before). Each was `vec![0u8; len]`, freed at the list's reset; blocks
+/// that large come from the kernel fresh and are faulted in page by page
+/// (a world frame took 69,450 page faults and 361 ms of kernel time). A
+/// kept block is zeroed to `len` before it is handed out, as a new one is,
+/// and is let go at the same moment as before, so nothing that read the
+/// old block reads the new one.
+#[cfg(windows)]
+fn list_arena() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_ARENA").is_some_and(|v| v == "1"))
+}
+
+/// Blocks kept ([`list_arena`]), by capacity; at most `ARENA_MOST` bytes.
+#[cfg(windows)]
+static ARENA: std::sync::Mutex<crate::staging_pool::Pool<Vec<u8>>> =
+    std::sync::Mutex::new(crate::staging_pool::Pool::new());
+#[cfg(windows)]
+const ARENA_MOST: u64 = 256 << 20;
+/// The smallest block kept: smaller ones are the allocator's.
+#[cfg(windows)]
+const ARENA_LEAST: usize = 64 << 10;
+
+impl Block {
+    /// `len` zeroed bytes.
+    fn new(len: usize) -> Self {
+        #[cfg(windows)]
+        if list_arena() && len >= ARENA_LEAST {
+            let kept = ARENA.lock().unwrap_or_else(|e| e.into_inner()).take(len as u64);
+            let mut block = match kept {
+                Some((block, _)) => block,
+                // At the size's class, so that it can stand in for others.
+                None => Vec::with_capacity(crate::staging_pool::class(len as u64) as usize),
+            };
+            block.clear();
+            block.resize(len, 0);
+            return Block(block);
+        }
+        Block(vec![0u8; len])
+    }
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if list_arena() && self.0.capacity() >= ARENA_LEAST {
+            let block = std::mem::take(&mut self.0);
+            let capacity = block.capacity() as u64;
+            let gone = ARENA.lock().unwrap_or_else(|e| e.into_inner()).give(block, capacity, ARENA_MOST);
+            // Freed outside the lock.
+            drop(gone);
+        }
+    }
+}
+
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
 /// owns until it is reset, which the CPU writes and the GPU reads at the
 /// same address; null on failure. The title's BVH builder puts
@@ -1428,8 +1490,8 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
-    let start = block.as_mut_ptr();
+    let mut block = Block::new(len);
+    let start = block.0.as_mut_ptr();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
