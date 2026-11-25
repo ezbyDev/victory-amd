@@ -57,9 +57,11 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library and the early list in `dir` from now on,
+/// saved also on the ways out that do not end the title ([`save_at_exits`]).
 pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
+    save_at_exits();
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -443,6 +445,8 @@ fn library() -> Option<&'static Library> {
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
+            } else {
+                start_saver();
             }
             library
         })
@@ -659,6 +663,112 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+}
+
+/// `VICTORY_PIPELINE_SAVE_EVERY`: seconds between the saves of a thread of
+/// its own (60; 0: no such thread). The workers save only after making a
+/// pipeline (at most every 20 s), so what they made in the 20 s before
+/// they ran out of work waited for the end of the run, and a run that
+/// crashed or was ended without that save lost it: the next run made
+/// thousands of pipelines again, minutes of "being made". The thread also
+/// saves at once when [`SAVE_AFTER`] pipelines were added. It is none of
+/// the title's threads, and a save is written beside the library and
+/// renamed over it, so no frame waits for it and a save cut short leaves
+/// the library on disk as it was.
+fn save_every() -> Option<std::time::Duration> {
+    static EVERY: OnceLock<u64> = OnceLock::new();
+    let secs = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_SAVE_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(60)
+    });
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Pipelines added since the last save that make the saving thread save
+/// before its time.
+const SAVE_AFTER: u64 = 256;
+
+/// Starts the thread of [`save_every`], once.
+fn start_saver() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let Some(every) = save_every() else { return };
+    STARTED.call_once(|| {
+        const LOOK: std::time::Duration = std::time::Duration::from_secs(5);
+        let spawned = std::thread::Builder::new().name("victory-pipeline-save".into()).spawn(move || {
+            loop {
+                std::thread::sleep(LOOK);
+                let Some(library) = library() else { return };
+                let added = library.added.load(Ordering::Relaxed);
+                if added == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let due = LAST_SAVE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none_or(|t| t.elapsed() >= every);
+                if due || added >= SAVE_AFTER {
+                    save(true);
+                }
+            }
+        });
+        match spawned {
+            Ok(_) => tracing::info!(
+                every_s = every.as_secs(),
+                after = SAVE_AFTER,
+                "pipeline library saved by a thread of its own (VICTORY_PIPELINE_SAVE_EVERY)"
+            ),
+            Err(e) => tracing::warn!(error = %e, "no thread to save the pipeline library"),
+        }
+    });
+}
+
+/// Saves now as [`save`] does, on a thread of its own, waiting `limit` at
+/// most: for the ways out of the process that do not save otherwise (a
+/// failure of the host GPU, the title's own exit, a panic, the console
+/// closed). A save that cannot finish in time (a lock the ending thread
+/// holds, a slow disk) is left behind: the file on disk stays the library
+/// saved last. Whether it finished.
+pub(crate) fn save_within(limit: std::time::Duration) -> bool {
+    if DIR.get().is_none() {
+        return true;
+    }
+    let (sent, done) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("victory-pipeline-save-exit".into()).spawn(move || {
+        save(true);
+        let _ = sent.send(());
+    });
+    spawned.is_ok() && done.recv_timeout(limit).is_ok()
+}
+
+/// Saves before the process ends on a panic or a closed console (its
+/// window closed, Ctrl+C): a panic hook in front of the earlier one, and a
+/// console handler that saves and leaves the ending to the next handler.
+/// Once.
+fn save_at_exits() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        static IN_HOOK: AtomicBool = AtomicBool::new(false);
+        let earlier = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Not again for a panic of the save itself.
+            if !IN_HOOK.swap(true, Ordering::SeqCst) {
+                let saved = save_within(std::time::Duration::from_secs(10));
+                tracing::info!(saved, "pipeline library saved at a panic");
+                IN_HOOK.store(false, Ordering::SeqCst);
+            }
+            earlier(info);
+        }));
+        unsafe extern "system" fn on_console(_kind: u32) -> windows_sys::core::BOOL {
+            // Windows ends the process 5 s after its console is closed.
+            let saved = save_within(std::time::Duration::from_secs(4));
+            tracing::info!(saved, "pipeline library saved as the console ends the process");
+            0 // the next handler: the default one ends the process
+        }
+        // SAFETY: a handler of ours, for the life of the process.
+        unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console), 1) };
+    });
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
