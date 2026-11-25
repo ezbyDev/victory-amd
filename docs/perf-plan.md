@@ -175,6 +175,12 @@ Built and unit-tested, **not yet measured in a run** (all default off unless not
 | `VICTORY_CARD_STAMPS=1` | — | our own card work on the card's clock (log only) |
 | always on | 4 | shared locks: view table, made slots, buffer map; one host-copy lookup per state change; no per-draw Vec in `bind`; capture ops free without a capture; cached heap GPU handle; drop reasons counted in atomics; pipelines known by pointer |
 
+Also on by default: the pipeline library saves on a background thread every 60 s (or after
+256 new pipelines; `VICTORY_PIPELINE_SAVE_EVERY=<s>`, `0` off), one save at a time through
+both renames (two overlapping saves could leave a half-written library, rejected at the next
+start), and within a time limit on panics, console close, the title's exits and host GPU
+failures.
+
 New log lines: `heap pass per frame: …`, `copystat: recording by part per frame`, the
 pools on `memory let go since the start:`, `our lists for copies in the card's memory on
 the card's clock`, and the submission-lock split.
