@@ -2658,6 +2658,22 @@ fn read_backs(list: &HostList) {
     }
 }
 
+/// With [`crate::shadow::wide_back`]: whether the merges of what shaders
+/// wrote into copies in the PC's memory run on the kept threads too, a
+/// range to a job (`VICTORY_WIDE_BACK_MERGE=1`; off by default: one after
+/// the other on the submitting thread, as before).
+///
+/// With the snapshots and the compares on several threads the merges are
+/// what is left on one: 26 ms a frame for 1,030 pieces in the last run's
+/// gameplay, each piece a read of title memory, a byte merge and a write.
+/// A merge touches only its own range of its copy and of title memory, as
+/// the card copies' merges do on the kept threads (`VICTORY_WIDE_MERGE`).
+/// The frame line's "putting them back" then sums the threads' times.
+fn wide_back_merge() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK_MERGE").is_some_and(|v| v == "1"))
+}
+
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
@@ -2685,12 +2701,32 @@ fn hand_back(back: &[Declared]) {
         let found = crate::shadow::find_all(&work);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
-        for ((shadow, from, to), found) in work.iter().zip(found) {
-            let written = shadow.copy_back_with(*from, to - from, Some(found));
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-            shadow.wrote_back(*from, to - from, written);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(*from, to - from, written);
+        if wide_back_merge() && work.len() >= 2 {
+            // Each range its own job: ranges of one copy are apart from one
+            // another (joined above), and take the copy's snapshot lock in
+            // turn; ranges of different copies run side by side.
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = work
+                .into_iter()
+                .zip(found)
+                .map(|((shadow, from, to), found)| {
+                    Box::new(move || {
+                        let written = shadow.copy_back_with(from, to - from, Some(found));
+                        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        shadow.wrote_back(from, to - from, written);
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::compared(from, to - from, written);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+        } else {
+            for ((shadow, from, to), found) in work.iter().zip(found) {
+                let written = shadow.copy_back_with(*from, to - from, Some(found));
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                shadow.wrote_back(*from, to - from, written);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::compared(*from, to - from, written);
+            }
         }
         for (shadow, declared) in back {
             shadow.copy_back_done(declared);

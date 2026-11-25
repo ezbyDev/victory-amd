@@ -2005,7 +2005,9 @@ impl Shadow {
             let mut title = vec![0u8; PIECE];
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
+                // writes it, or with `VICTORY_WIDE_BACK_MERGE` a kept
+                // thread it waits for, one per range, under the snapshot's
+                // lock held here.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 // From the first byte that differs to the last: title
