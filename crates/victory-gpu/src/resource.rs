@@ -1125,6 +1125,10 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// Its resource flags, as the host has them: what states it may take
+    /// (`crate::host::legal_for`), asked once here instead of at every
+    /// state change a draw records.
+    pub(crate) flags: u32,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1545,11 +1549,14 @@ impl HostTexture {
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        // SAFETY: a live resource.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            flags,
         }
     }
 }

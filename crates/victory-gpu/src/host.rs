@@ -3899,6 +3899,11 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // The wait for the lock alone ("waiting for the submission lock"
+        // counts from here to the start: settles, the sweep and the slots
+        // made late as well).
+        #[cfg(feature = "diagnostics")]
+        let mutex = called.elapsed().as_micros() as u64;
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -4034,7 +4039,7 @@ impl Host {
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::submission_ends(lock);
+            crate::copystat::submission_ends(lock, mutex);
             let sent = Sent {
                 number: this_submission,
                 card,
@@ -4178,7 +4183,7 @@ impl Host {
         self.log_messages();
         submitting(0, 0);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::submission_ends(lock);
+        crate::copystat::submission_ends(lock, mutex);
         // With the relay: nothing is in the air now, so no fetch still to
         // be merged is older than the sends to card copies so far, and
         // their notes can go.
@@ -4505,9 +4510,28 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
+        self.transition_legal(resource, wanted)
+            .map(|(texture, before, _)| (texture, before))
+    }
+
+    /// [`HostList::transition`], with the state moved to as the texture may
+    /// take it (`legal_state` of `wanted`).
+    ///
+    /// The host copy is looked up once (it was twice, through
+    /// `host_resource` and `host_copy`: each a lock, two reference counts
+    /// and a clock read), and its flags are the ones kept with it, not asked
+    /// of the host (twice, with [`crate::list::ensure_state`]): this runs for
+    /// every texture and target of every draw.
+    pub(crate) fn transition_legal(
+        &self,
+        resource: crate::object::This,
+        wanted: u32,
+    ) -> Option<(&'static ID3D12Resource, u32, u32)> {
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        // SAFETY: as for `crate::resource::host_resource`, of the same host
+        // copy; this list's states also hold it from here until its reset.
+        let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
+        let wanted = legal_for(copy.flags, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -4516,7 +4540,7 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some((texture, before, wanted))
             }
         }
     }

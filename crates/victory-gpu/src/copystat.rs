@@ -133,12 +133,45 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Recording by part ([`timed`]): draws, dispatches and indirect
+    /// executions recorded and their nanoseconds; and within them, the
+    /// nanoseconds of the descriptor tables (and of the texture uploads
+    /// those ask for), of title memory by address, root views (the heap
+    /// pass included), root unordered access views, vertex and index
+    /// buffers, and the target and depth states. Then render targets set.
+    RecDraws,
+    RecDrawNs,
+    RecTablesNs,
+    RecTexUploadNs,
+    RecMemoryNs,
+    RecRootViewsNs,
+    RecRootUavsNs,
+    RecBuffersNs,
+    RecStatesNs,
+    RecTargetsNs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Adds the nanoseconds until it is dropped to counter `c` (a part of
+/// recording). Two clock reads: some 50 ns, against 49-120 us a list call.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timed(c: C) -> Timed {
+    Timed(c as usize, std::time::Instant::now())
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) struct Timed(usize, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Timed {
+    fn drop(&mut self) {
+        COUNT[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
+    }
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -898,6 +931,10 @@ struct Submitter {
     between_ours: u64,
     /// Waiting for the submission lock; running inside submissions.
     lock: u64,
+    /// Of `lock`, the wait for the lock itself: the rest is what a
+    /// submission does before it starts (settling flights in the air, the
+    /// sweep once a second, the slots that waited for a texture).
+    mutex: u64,
     inside_user: u64,
     inside_kernel: u64,
 }
@@ -1008,8 +1045,9 @@ pub(crate) fn submission_begins() {
 }
 
 /// The submission returns; it waited `lock` microseconds for the
-/// submission lock.
-pub(crate) fn submission_ends(lock: u64) {
+/// submission lock and what comes before its start, `mutex` of them for
+/// the lock alone.
+pub(crate) fn submission_ends(lock: u64, mutex: u64) {
     let now = now_us();
     SUBMITTED_AT.store(now, Relaxed);
     let (user, kernel) = thread_times();
@@ -1020,6 +1058,7 @@ pub(crate) fn submission_ends(lock: u64) {
     let s = submitter(&mut all, thread_id());
     s.submissions += 1;
     s.lock += lock;
+    s.mutex += mutex;
     s.inside_user += user.saturating_sub(u);
     s.inside_kernel += kernel.saturating_sub(k);
 }
@@ -1124,6 +1163,22 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PaceUs as usize]),
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
+    );
+    // The same list calls by part (builds with diagnostics), to see what a
+    // call's 49-120 us go to.
+    tracing::info!(
+        "recording by part per frame: {:.0} draws and dispatches {:.1} ms, the other list calls          {:.1} ms; in the draws: tables {:.1} ms (texture uploads {:.1} ms of it), title memory          by address {:.1} ms, root views {:.1} ms (the heap pass in it), root unordered views          {:.1} ms, vertex and index buffers {:.1} ms, target and depth states {:.1} ms; render          targets set {:.1} ms",
+        c[C::RecDraws as usize],
+        c[C::RecDrawNs as usize] / 1e6,
+        (c[C::RecordNs as usize] - c[C::RecDrawNs as usize]).max(0.0) / 1e6,
+        c[C::RecTablesNs as usize] / 1e6,
+        c[C::RecTexUploadNs as usize] / 1e6,
+        c[C::RecMemoryNs as usize] / 1e6,
+        c[C::RecRootViewsNs as usize] / 1e6,
+        c[C::RecRootUavsNs as usize] / 1e6,
+        c[C::RecBuffersNs as usize] / 1e6,
+        c[C::RecStatesNs as usize] / 1e6,
+        c[C::RecTargetsNs as usize] / 1e6,
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
@@ -1281,7 +1336,7 @@ pub(crate) fn log(frames: f64) {
         tracing::info!(
             "  thread {id} submitted {:.1}x/frame: between its submissions {:.1} ms (running \
              {:.1} ms user + {:.1} ms kernel; {:.1} ms in list calls), in them running {:.1} ms \
-             user + {:.1} ms kernel, {:.1} ms waiting for the submission lock",
+             user + {:.1} ms kernel, {:.1} ms waiting for the submission lock (of it {:.1} ms              for the lock itself; the rest settling flights, the sweep and slots made late)",
             s.submissions as f64 / frames,
             per(s.between),
             per(s.between_user),
@@ -1290,6 +1345,7 @@ pub(crate) fn log(frames: f64) {
             per(s.inside_user),
             per(s.inside_kernel),
             per(s.lock),
+            per(s.mutex),
         );
     }
     let mut recorders = std::mem::take(&mut *RECORDERS.lock().unwrap_or_else(|e| e.into_inner()));

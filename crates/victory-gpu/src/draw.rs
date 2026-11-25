@@ -591,6 +591,8 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::timed(crate::copystat::C::RecTargetsNs);
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -860,6 +862,8 @@ impl State {
             return false;
         }
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        let buffers = crate::copystat::timed(crate::copystat::C::RecBuffersNs);
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
@@ -901,6 +905,10 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
+        #[cfg(feature = "diagnostics")]
+        drop(buffers);
+        #[cfg(feature = "diagnostics")]
+        let _states = crate::copystat::timed(crate::copystat::C::RecStatesNs);
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
@@ -987,7 +995,11 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            #[cfg(feature = "diagnostics")]
+            let tables = crate::copystat::timed(crate::copystat::C::RecTablesNs);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            #[cfg(feature = "diagnostics")]
+            drop(tables);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -999,6 +1011,8 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                #[cfg(feature = "diagnostics")]
+                let _timed = crate::copystat::timed(crate::copystat::C::RecMemoryNs);
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
@@ -1008,7 +1022,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // On the stack (a root signature holds at most 64 dwords):
+                // this was an allocation per stage of every draw.
+                let mut stack = [0u32; 64];
+                let mut spilled = Vec::new();
+                let values: &mut [u32] = if dwords as usize <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    spilled.resize(dwords as usize, 0);
+                    &mut spilled
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1032,6 +1055,8 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            let roots = crate::copystat::timed(crate::copystat::C::RecRootViewsNs);
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -1111,6 +1136,10 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            drop(roots);
+            #[cfg(feature = "diagnostics")]
+            let _uavs = crate::copystat::timed(crate::copystat::C::RecRootUavsNs);
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
@@ -2703,6 +2732,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
+                #[cfg(feature = "diagnostics")]
+                let _timed = crate::copystat::timed(crate::copystat::C::RecTexUploadNs);
                 crate::texture::upload(list, *resource as This, t);
             }
             // A depth texture shaders also write: what they wrote, first.
@@ -2717,8 +2748,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // (Looked at only when the line can be logged: for every texture
+            // every draw reads, a third lookup of its host copy and a
+            // description asked of the host, for a debug line.)
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let Some(t) = crate::resource::host_resource(*resource as This)
+            {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {

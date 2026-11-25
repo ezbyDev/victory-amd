@@ -59,6 +59,14 @@ pub(crate) fn listed(n: u64) -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
+    // Without a capture folder nothing below is ever written out (the
+    // lines kept before the world go to the folder too): every draw,
+    // dispatch, copy and note of a run without `VICTORY_CAPTURE` came here
+    // to look up the frame and the lists of frames for nothing, some
+    // 18,000 times a world frame.
+    if folder().is_none() {
+        return;
+    }
     let frame = crate::queue::presented() + 1;
     if !listed(frame) {
         // Before the world: the last lines are kept, and written out when
