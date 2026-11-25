@@ -924,6 +924,10 @@ struct Submitter {
     between_ours: u64,
     /// Waiting for the submission lock; running inside submissions.
     lock: u64,
+    /// Of `lock`, the wait for the lock itself: the rest is what a
+    /// submission does before it starts (settling flights in the air, the
+    /// sweep once a second, the slots that waited for a texture).
+    mutex: u64,
     inside_user: u64,
     inside_kernel: u64,
 }
@@ -1034,8 +1038,9 @@ pub(crate) fn submission_begins() {
 }
 
 /// The submission returns; it waited `lock` microseconds for the
-/// submission lock.
-pub(crate) fn submission_ends(lock: u64) {
+/// submission lock and what comes before its start, `mutex` of them for
+/// the lock alone.
+pub(crate) fn submission_ends(lock: u64, mutex: u64) {
     let now = now_us();
     SUBMITTED_AT.store(now, Relaxed);
     let (user, kernel) = thread_times();
@@ -1046,6 +1051,7 @@ pub(crate) fn submission_ends(lock: u64) {
     let s = submitter(&mut all, thread_id());
     s.submissions += 1;
     s.lock += lock;
+    s.mutex += mutex;
     s.inside_user += user.saturating_sub(u);
     s.inside_kernel += kernel.saturating_sub(k);
 }
@@ -1323,7 +1329,7 @@ pub(crate) fn log(frames: f64) {
         tracing::info!(
             "  thread {id} submitted {:.1}x/frame: between its submissions {:.1} ms (running \
              {:.1} ms user + {:.1} ms kernel; {:.1} ms in list calls), in them running {:.1} ms \
-             user + {:.1} ms kernel, {:.1} ms waiting for the submission lock",
+             user + {:.1} ms kernel, {:.1} ms waiting for the submission lock (of it {:.1} ms              for the lock itself; the rest settling flights, the sweep and slots made late)",
             s.submissions as f64 / frames,
             per(s.between),
             per(s.between_user),
@@ -1332,6 +1338,7 @@ pub(crate) fn log(frames: f64) {
             per(s.inside_user),
             per(s.inside_kernel),
             per(s.lock),
+            per(s.mutex),
         );
     }
     let mut recorders = std::mem::take(&mut *RECORDERS.lock().unwrap_or_else(|e| e.into_inner()));

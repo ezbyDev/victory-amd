@@ -3860,6 +3860,11 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // The wait for the lock alone ("waiting for the submission lock"
+        // counts from here to the start: settles, the sweep and the slots
+        // made late as well).
+        #[cfg(feature = "diagnostics")]
+        let mutex = called.elapsed().as_micros() as u64;
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -3995,7 +4000,7 @@ impl Host {
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::submission_ends(lock);
+            crate::copystat::submission_ends(lock, mutex);
             let sent = Sent {
                 number: this_submission,
                 card,
@@ -4139,7 +4144,7 @@ impl Host {
         self.log_messages();
         submitting(0, 0);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::submission_ends(lock);
+        crate::copystat::submission_ends(lock, mutex);
         // With the relay: nothing is in the air now, so no fetch still to
         // be merged is older than the sends to card copies so far, and
         // their notes can go.
