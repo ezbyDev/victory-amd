@@ -1433,7 +1433,41 @@ struct CardWork {
     taken: u32,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
+    /// With [`card_stamps`]: timestamps around our lists.
+    stamps: Option<CardStamps>,
 }
+
+/// Whether our own lists for copies in the card's memory (the sending up
+/// with its hash passes before a submission's lists, the compare after
+/// them) are timed on the card (`VICTORY_CARD_STAMPS=1`, diagnostics
+/// builds; off by default). Two timestamps per list, read when the plan is
+/// done (`Host::card_done`), summed for the frame line. Unlike
+/// `VICTORY_GPU_TIMING` nothing else changes: the lists go to the card as
+/// they do, and the title's lists are not timed. A timestamp is taken when
+/// the card gets to it, so a list's time may also hold the end of the work
+/// before it; the compare starts behind a wait for every shader write of
+/// the title's lists.
+fn card_stamps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_CARD_STAMPS").is_some_and(|v| v == "1"))
+}
+
+/// Plans whose timestamps are kept at once ([`card_stamps`]), four each.
+const CARD_STAMP_PLANS: u32 = 256;
+
+/// The timestamps of [`card_stamps`]: the heap, where they are resolved
+/// (read-back memory, mapped), and the next plan's place.
+struct CardStamps {
+    heap: ID3D12QueryHeap,
+    back: ID3D12Resource,
+    data: usize,
+    next: u32,
+}
+
+/// Since the last frame line, from [`card_stamps`]: microseconds of our
+/// sending-up lists on the card and how many, of our compare lists and how
+/// many.
+static CARD_STAMP_US: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
 // under the submission lock.
@@ -1630,6 +1664,9 @@ struct CardPlan {
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
+    /// With [`card_stamps`]: the plan's first timestamp, and whether its
+    /// sending up and its compare were timed.
+    stamp: Option<(u32, bool, bool)>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3076,7 +3113,32 @@ impl Host {
                 fetched: None,
                 taken: 0,
                 out: 0,
+                stamps: if card_stamps() { self.make_card_stamps() } else { None },
             })
+        }
+    }
+
+    /// [`CardStamps`], or `None` (and a warning) if the card has none.
+    fn make_card_stamps(&self) -> Option<CardStamps> {
+        let back = self.read_back_buffer(u64::from(CARD_STAMP_PLANS) * 4 * 8)?;
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain object creation; a read-back buffer mapped whole
+        // for reading, as long as it lives.
+        let made = unsafe {
+            self.device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: CARD_STAMP_PLANS * 4, NodeMask: 0 },
+                    &mut heap,
+                )
+                .and_then(|()| back.Map(0, None, Some(&mut data)))
+        };
+        match (made, heap) {
+            (Ok(()), Some(heap)) if !data.is_null() => Some(CardStamps { heap, back, data: data as usize, next: 0 }),
+            _ => {
+                tracing::warn!("VICTORY_CARD_STAMPS: no timestamps for our lists on the card");
+                None
+            }
         }
     }
 
@@ -3130,6 +3192,12 @@ impl Host {
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
+        let stamp = work.stamps.as_mut().map(|stamps| {
+            let at = stamps.next * 4;
+            stamps.next = (stamps.next + 1) % CARD_STAMP_PLANS;
+            at
+        });
+        let mut stamped = (false, false);
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -3158,6 +3226,9 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    if let (Some(stamps), Some(at)) = (&work.stamps, stamp) {
+                        list.EndQuery(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at);
+                    }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3203,6 +3274,11 @@ impl Host {
                             list.Dispatch(card_groups(run.pieces), 1, 1);
                         }
                     }
+                    if let (Some(stamps), Some(at)) = (&work.stamps, stamp) {
+                        list.EndQuery(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at + 1);
+                        list.ResolveQueryData(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at, 2, &stamps.back, u64::from(at) * 8);
+                        stamped.0 = true;
+                    }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -3219,6 +3295,7 @@ impl Host {
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
+            stamp: None,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3277,6 +3354,9 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    if let (Some(stamps), Some(at)) = (&work.stamps, stamp) {
+                        list.EndQuery(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at + 2);
+                    }
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
@@ -3288,6 +3368,11 @@ impl Host {
                         list.Dispatch(card_groups(r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    if let (Some(stamps), Some(at)) = (&work.stamps, stamp) {
+                        list.EndQuery(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at + 3);
+                        list.ResolveQueryData(&stamps.heap, D3D12_QUERY_TYPE_TIMESTAMP, at + 2, 2, &stamps.back, u64::from(at + 2) * 8);
+                        stamped.1 = true;
+                    }
                     list.Close()?;
                     list.cast()
                 })()
@@ -3298,6 +3383,7 @@ impl Host {
             }
             plan.lists.push((true, check));
         }
+        plan.stamp = stamp.map(|at| (at, stamped.0, stamped.1));
         work.out += 1;
         Some(plan)
     }
@@ -3322,6 +3408,20 @@ impl Host {
         let Some(work) = work.as_mut() else {
             return;
         };
+        if let (Some(stamps), Some((at, sync, check))) = (&work.stamps, plan.stamp) {
+            // SAFETY: a plain query.
+            let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0).max(1);
+            // SAFETY: the mapping holds every plan's four stamps; the
+            // plan's lists have run, so their resolves have.
+            let read = |i: u32| unsafe { (stamps.data as *const u64).add((at + i) as usize).read_volatile() };
+            let us = |a: u64, b: u64| b.saturating_sub(a).saturating_mul(1_000_000) / frequency;
+            for (timed, first, slot) in [(sync, 0u32, 0usize), (check, 2, 2)] {
+                if timed {
+                    CARD_STAMP_US[slot].fetch_add(us(read(first), read(first + 1)), Ordering::Relaxed);
+                    CARD_STAMP_US[slot + 1].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         for (check, list) in plan.lists {
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
@@ -5812,6 +5912,15 @@ impl Meter {
                      ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes                      (VICTORY_CARD_WIDE_HASH=1, a group of 64 threads to a piece: now {})",
                     if rehash_runs() { "on" } else { "off" },
                     if card_wide_hash() { "on" } else { "off" }
+                );
+            }
+            let [sync_us, syncs, check_us, checks] = [0, 1, 2, 3].map(|i| CARD_STAMP_US[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if card_stamps() {
+                tracing::info!(
+                    "our lists for copies in the card's memory on the card's clock per frame (VICTORY_CARD_STAMPS): sending up and \
+                     hashing {:.2} ms in {syncs:.1} lists, comparing {:.2} ms in {checks:.1} lists",
+                    sync_us / 1e3,
+                    check_us / 1e3
                 );
             }
         }
