@@ -1239,6 +1239,40 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        // The slot made from this record already, as it is for nearly every
+        // table entry a draw reads: nothing to change, under a shared lock.
+        // The lock is the heap's, which every recording thread and every
+        // descriptor the title writes needs: taken whole for each lookup,
+        // the six recording threads stood in line for it entry by entry.
+        if index < self.count {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if tag == VIEW_TAG {
+                let made = self.made.read().unwrap_or_else(|e| e.into_inner());
+                if made[index as usize] == key
+                    && let Some(view) = view_at(i, generation)
+                {
+                    return Some(view);
+                }
+            }
+        }
+        let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
+        self.mirror_in(&mut made, index, handle, for_draw)
+    }
+
+    /// [`HostHeap::mirror`] for each of `slots` (title slot, handle), under
+    /// one taking of the made slots' lock: the views in `out`, in order.
+    /// The pass over the heap's buffer views took it once per slot, for
+    /// thousands of slots a pass (83,000 at its full look every 16 passes).
+    pub(crate) fn mirror_many(&self, slots: &[(u32, u64)], for_draw: bool, out: &mut Vec<Option<View>>) {
+        out.clear();
+        let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
+        out.extend(slots.iter().map(|&(index, handle)| self.mirror_in(&mut made, index, handle, for_draw)));
+    }
+
+    /// [`HostHeap::mirror`] with the made slots' lock held.
+    fn mirror_in(&self, made: &mut [u64], index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -1257,20 +1291,6 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        // The slot made from this record already, as it is for nearly every
-        // table entry a draw reads: nothing to change, under a shared lock.
-        // The lock is the heap's, which every recording thread and every
-        // descriptor the title writes needs: taken whole for each lookup,
-        // the six recording threads stood in line for it entry by entry.
-        if tag == VIEW_TAG {
-            let made = self.made.read().unwrap_or_else(|e| e.into_inner());
-            if made[index as usize] == key
-                && let Some(view) = view_at(i, generation)
-            {
-                return Some(view);
-            }
-        }
-        let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -1291,7 +1311,7 @@ impl HostHeap {
             // let go of the host copies they held.
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
-                    self.unmake(&mut made, stale);
+                    self.unmake(made, stale);
                 }
             }
             // A view of a texture object that has no host copy yet waits
