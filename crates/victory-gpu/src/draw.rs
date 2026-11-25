@@ -325,6 +325,16 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the pass over the heap's buffer views makes the host views of
+/// 64 slots at a time under one taking of the heap's lock of made slots
+/// (`VICTORY_HEAP_SLOTS_BATCH=1`), instead of once per slot: thousands of
+/// slots a pass, all 83,000 every 16th, in a pass of 187 ms a world frame
+/// (97-592). The same views are made in the same order. Off by default.
+fn heap_slots_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SLOTS_BATCH").is_some_and(|v| v == "1"))
+}
+
 /// Where the heap pass's time goes (diagnostics): the pass took 1,403 ms
 /// of a 1,867 ms world frame and nothing said which part. Microseconds per
 /// part since the last frame line, by [`HeapPart`]; then the texture slots
@@ -1411,12 +1421,34 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let batch = heap_slots_batch();
+        let (mut asked, mut had, mut made) = (Vec::new(), Vec::new(), Vec::new());
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
+            if batch && n % 64 == 0 {
+                // The host views of this slot and the next 63 (those the
+                // device check below covers), under one taking of the lock.
+                (asked.clear(), had.clear());
+                for &i in &slots[n..(n + 64).min(slots.len())] {
+                    let handle = heap.handle(i);
+                    had.push(handle.is_some());
+                    asked.extend(handle.map(|h| (i, h)));
+                }
+                host.mirror_many(&asked, true, &mut made);
+                made.reverse();
+            }
+            let view = if batch {
+                if !had[n % 64] {
+                    continue;
+                }
+                made.pop().flatten()
+            } else {
+                let Some(handle) = heap.handle(index) else {
+                    continue;
+                };
+                host.mirror(index, handle, true)
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let Some(view) = view else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
