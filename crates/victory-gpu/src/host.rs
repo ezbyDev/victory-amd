@@ -1581,6 +1581,9 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
+    /// Of `uploads`, those to give to the upload pool when the list lets
+    /// go of them ([`upload_ring`]): buffer, mapping, capacity.
+    pooled: Vec<(ID3D12Resource, usize, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1611,13 +1614,52 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+
+    /// Holds a pooled upload buffer (`capacity` bytes mapped at `data`)
+    /// until the list is reset, and then gives it to the pool.
+    fn hold_pooled(&mut self, buffer: ID3D12Resource, data: *mut u8, capacity: u64) {
+        self.hold_upload(buffer.clone(), capacity);
+        self.pooled.push((buffer, data as usize, capacity));
+    }
 }
 
 impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // The list is reset after its last submission ran, or dropped after
+        // it ran or without one: the card reads none of these any more.
+        for (buffer, data, capacity) in self.pooled.drain(..) {
+            crate::staging_pool::give(crate::staging_pool::Kept { buffer, data }, capacity);
+        }
     }
+}
+
+/// Whether host lists' own upload buffers (`HostList::upload`: texture
+/// data copied from title buffers; scratch past a chunk's 4 MiB) are taken
+/// from the upload pool of let-go staging buffers (`crate::staging_pool`)
+/// and given back when the list is reset (`VICTORY_UPLOAD_RING=1`). Each was
+/// a committed upload resource made, zeroed by the kernel page by page and
+/// freed per use; with the defaults of the last measurement a world frame
+/// still took 69,450 page faults and 361 ms of kernel time, and 7,182
+/// upload buffers were made over the run. Off by default: one buffer per
+/// use, as before.
+fn upload_ring() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_RING").is_some_and(|v| v == "1"))
+}
+
+/// An upload buffer for `size` bytes from the pool, or one made at the
+/// size's class so that it can stand in for others later: buffer, mapping,
+/// capacity.
+fn pooled_upload(host: &Host, size: u64, what: &str) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    if let Some((kept, capacity)) = crate::staging_pool::take_any(size) {
+        return Some((kept.buffer, kept.data as *mut u8, capacity));
+    }
+    let capacity = crate::staging_pool::class(size);
+    let (buffer, data) = host.upload_buffer(capacity)?;
+    name(&buffer, || format!("{what} {capacity:#x}"));
+    Some((buffer, data, capacity))
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
@@ -4931,6 +4973,11 @@ impl HostList {
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if upload_ring() {
+            let (buffer, data, capacity) = pooled_upload(host, size, "list upload")?;
+            self.deferred().hold_pooled(buffer.clone(), data, capacity);
+            return Some((buffer, data));
+        }
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
@@ -4943,6 +4990,13 @@ impl HostList {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
+        if len > SCRATCH_CHUNK && upload_ring() {
+            let (buffer, data, capacity) = pooled_upload(host, len, "list scratch")?;
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.deferred().hold_pooled(buffer, data, capacity);
+            return Some((gpu, data));
+        }
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));

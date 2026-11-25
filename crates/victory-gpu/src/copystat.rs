@@ -748,7 +748,7 @@ fn log_memory() {
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
-         asked for in each; staging pool: {} buffers kept {:.0} MB, {} taken from it, {} made \
+         asked for in each; upload pool (staging; list uploads with VICTORY_UPLOAD_RING=1): {} buffers kept {:.0} MB, {} taken from it, {} made \
          anew, {} freed past its cap",
         windows[0],
         mb(windows[1]),

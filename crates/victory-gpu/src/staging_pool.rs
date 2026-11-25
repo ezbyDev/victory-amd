@@ -13,6 +13,9 @@
 //! `VICTORY_STAGING_POOL=1` turns this on (off by default: a buffer per
 //! texture, as before). `VICTORY_STAGING_POOL_MB` caps the bytes kept
 //! (1024 by default); past it the buffers given back longest ago are freed.
+//! Host lists' own upload buffers (`HostList::upload`, scratch too big for
+//! a chunk) share the pool with `VICTORY_UPLOAD_RING=1`: they are held until
+//! the list is reset after its last submission ran, as staging is.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -140,6 +143,12 @@ pub(crate) fn take(size: u64) -> Option<(Kept, u64)> {
     if !on() {
         return None;
     }
+    take_any(size)
+}
+
+/// A kept upload buffer for `size` bytes and its capacity, whichever user
+/// turned the pool on (list uploads: `crate::host::upload_ring`).
+pub(crate) fn take_any(size: u64) -> Option<(Kept, u64)> {
     let taken = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(size);
     COUNTS[usize::from(taken.is_none())].fetch_add(1, Relaxed);
     taken
