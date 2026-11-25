@@ -5,10 +5,10 @@ An experimental **Xbox Series compatibility layer for Windows**, tuned for **AMD
 process, supplies the platform underneath it (loader, runtime services, Direct3D 12.X on top
 of the PC's Direct3D 12), and recompiles the console's GPU shaders to DXIL.
 
-victory-amd is a fork of [VIctory](https://github.com/Marvisak/VIctory), by way of
-[victory-fork](https://github.com/fxceless/victory-fork). Almost all of the code is theirs
-(see [Credits](#credits)); this fork collects the open fixes and settings that make it run
-stably on AMD hardware, where the defaults tuned on NVIDIA cards fail.
+victory-amd takes a layer built and tuned on NVIDIA cards and makes it work on AMD. On a
+Radeon the inherited defaults lose the GPU device, crash the driver's shader compiler, hang
+the card, or leave most of a scene undrawn for minutes. This project found why, one cause
+at a time, and puts together the configuration and fixes that make it run.
 
 **This repository contains no game files, no game code and no game assets, and it never
 will** (see [docs/asset-policy.md](docs/asset-policy.md)). You need your own, legally
@@ -56,31 +56,54 @@ driver 32.0.32029.2010, Intel Core i7-9700K, 32 GB RAM, Series X profile.
 - **Memory:** about 17–24 GB of RAM in use during play; a large Windows paging file helps.
 - Tested on one GPU, with one title. Other titles and other cards are unknown.
 
-## What this fork adds to victory-fork
+## What this project did
 
-Code (each from an open pull request or fork of victory-fork, merged unchanged except where
-two of them touched the same lines):
+All of it measured on the RX 9060 XT above, from VIctory's own logs, crash reports and GPU
+breadcrumbs (DRED), one change per run.
 
-- **Skipped pipelines are not compiled early** — victory-fork
-  [#172](https://github.com/fxceless/victory-fork/pull/172) by ericomeehan. Without it,
-  skipping a shader that crashes the driver's compiler does not help.
-- **Texture queue limits and pipeline skipping in release builds** — victory-fork
-  [#106](https://github.com/fxceless/victory-fork/pull/106) by PastiiJay
-  (`VICTORY_TEXTURE_QUEUE_MB`, `VICTORY_TEXTURE_QUEUE_MS`).
-- **Pipeline worker count and priority** — commit `76bec97` from
-  [bathyal-vi](https://github.com/T-Crypt/bathyal-vi) by T-Crypt
-  (`VICTORY_PIPELINE_WORKERS`, `VICTORY_PIPELINE_PRIORITY`).
+**Found here:**
+- **Most of the scene was missing** because the meshlet culling pass had been skipped, a
+  workaround AMD setups used for an earlier hang. With it running, characters, clothing and
+  faces render.
+- **Missing walls and a frozen loading screen while the title ran on behind it:** a backlog
+  of about 1,500 pipelines being built at one a second, because four workers ran below the
+  title's own threads. Six workers at normal priority clear it in seconds instead of minutes.
+- **The safe set of skips:** of the dozens of compute programs AMD setups skipped, only five
+  still crash, page-fault or never finish on AMD's driver with the settings here; the rest
+  run, among them the ones that shade characters' materials.
+- **A GPU hang without a loop cap** on this card, from a translated loop running until
+  Windows resets it; capped at 1,024 iterations.
+- **Tooling traps** that make runs misleading: logging the title's output through PowerShell
+  stalls the title, and settings left in a window change the next test.
 
-Settings that matter on AMD, found by victory-fork's testers and confirmed here:
+**Confirmed here, after reports by other testers:**
+- The submission relay thread (`VICTORY_RELAY`), which NVIDIA setups turn on, loses the
+  device on AMD (seen here as a page fault at an address with no memory behind it). Without
+  it, with submissions sent ahead instead (`VICTORY_LATE_WAIT=3`), the device stays up.
+- One of the translator's clean-up passes (pass 4) makes AMD's shader compiler crash
+  (`amdxc64.dll`); with it off (`VICTORY_SHADER_OPT=11`) those programs compile.
+- A skipped pipeline was still compiled ahead of its first use, so skipping a crashing
+  program did not help; the build includes the change that fixes that.
+- A larger texture-queue budget makes textures arrive in seconds instead of minutes.
+
+**Built:** the combined code (the changes below, with their conflicts resolved), the AMD
+configuration, `scripts/run-amd.ps1`, and this documentation, including the tooling traps
+met on the way (logging through PowerShell stalls the title; settings linger in a window).
+
+Changes from other projects included in the code: victory-fork pull requests #172 (skipped
+pipelines are not compiled early) and #106 (texture queue limits), and T-Crypt's
+pipeline-worker commit.
+
+### The AMD settings
 
 | Setting | Why |
 |---------|-----|
-| `VICTORY_LATE_WAIT=3` | sends submissions ahead without waiting for the card; about 3× the frame rate, stable on AMD |
-| no `VICTORY_RELAY` | the relay thread removes the GPU device on AMD within minutes (victory-fork [#60](https://github.com/fxceless/victory-fork/issues/60)) |
-| `VICTORY_SHADER_OPT=11` | shader clean-up pass 4 makes AMD's compiler crash (`amdxc64.dll`) on many compute programs (victory-fork [#145](https://github.com/fxceless/victory-fork/issues/145)) |
-| `VICTORY_SHADER_LOOP_LIMIT=1024` | without a cap, a translated loop can run long enough for Windows to reset the GPU |
-| `VICTORY_PIPELINE_WORKERS=6`, `VICTORY_PIPELINE_PRIORITY=normal` | with the default 4 low-priority workers, pipelines are built at about one a second and most of the scene is dropped for minutes |
-| `VICTORY_TEXTURE_QUEUE_MB=1024`, `VICTORY_TEXTURE_QUEUE_MS=1000` | textures picked by index arrive in seconds instead of minutes |
+| `VICTORY_LATE_WAIT=3` | sends submissions ahead without waiting for the card; about 3× the frame rate, stable |
+| no `VICTORY_RELAY` | the relay thread loses the GPU device on AMD within minutes |
+| `VICTORY_SHADER_OPT=11` | clean-up pass 4 off: it makes AMD's shader compiler crash |
+| `VICTORY_SHADER_LOOP_LIMIT=1024` | a translated loop can otherwise run until Windows resets the GPU |
+| `VICTORY_PIPELINE_WORKERS=6`, `VICTORY_PIPELINE_PRIORITY=normal` | pipelines are built fast enough for scenes to appear |
+| `VICTORY_TEXTURE_QUEUE_MB=1024`, `VICTORY_TEXTURE_QUEUE_MS=1000` | textures picked by index arrive in seconds |
 | `VICTORY_SKIP_PIPELINES=...` | five compute programs that crash or hang AMD's driver (listed in `scripts/run-amd.ps1`) |
 
 ## Getting started
@@ -157,38 +180,24 @@ Upstream's architecture notes are in [docs/architecture.md](docs/architecture.md
 
 ## Planned improvements
 
-1. Frame rate: reduce the per-frame copy-back of GPU results (victory-fork's
-   `VICTORY_CARD_BUFFERS*` and `VICTORY_WIDE_BACK` work), measured one switch at a time on AMD.
+1. Frame rate: cut the per-frame copy-back of GPU results (the `VICTORY_CARD_BUFFERS*` and
+   `VICTORY_WIDE_BACK` switches), measured one switch at a time on AMD.
 2. Keep built pipelines when a run ends abnormally, so restarts do not rebuild them.
 3. The bright purple artifacts: find which shader writes out-of-range values.
-4. Faceted shading: test victory-fork's interpolation and signature fixes (#52, #61, #110,
-   #112) on AMD.
-5. Fix the AMD compiler and page-fault cases in the translator, so fewer shaders need
+4. Faceted shading: fix how interpolated values reach pixel shaders.
+5. Fix the remaining AMD compiler and page-fault cases in the translator, so no shader needs
    skipping.
-6. Ray-traced lighting, following victory-fork's work in
-   [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+6. Ray-traced lighting (see [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md)).
 
 Contributions follow the asset policy: **nothing from any game, in any form** — no files,
 no dumps, no screenshots, no shader listings.
 
-## Credits
+## Based on
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors: the
-  loader, runtime services, Direct3D 12.X back end and shader recompiler — essentially all
-  of the code. GPL-3.0-or-later.
-- **[victory-fork](https://github.com/fxceless/victory-fork)** by fxceless and its
-  contributors: the world-rendering, speed and memory work this fork is based on (commit
-  `4e17478` of its `main` plus commits up to `2119b0e`).
-- **ericomeehan** (#172), **PastiiJay** (#106) and **T-Crypt** (bathyal-vi): the changes
-  listed above.
-- The victory-fork testers whose reports found the AMD settings, among them srcamarda
-  (#60), hashdev512 (#145), luisaugustz and nullmarsh (#3).
-- [XCL](https://github.com/ivall/xcl) by ivall was used by victory-fork as a behavioural
-  reference; no XCL code is included.
-- Assembled and tested with [Claude Code](https://claude.com/claude-code).
-
-This repository's history starts with a single commit holding the combined code; the
-individual history lives in the projects above.
+[VIctory](https://github.com/Marvisak/VIctory) (GPL-3.0-or-later), by way of
+[victory-fork](https://github.com/fxceless/victory-fork) at `2119b0e`, with the changes
+listed under "What this project did". This repository's history starts with one commit
+holding the combined code; the earlier history is in those projects.
 
 ## License
 
