@@ -171,7 +171,7 @@ Built and unit-tested, **not yet measured in a run** (all default off unless not
 | `VICTORY_CARD_WRITTEN_MIN_MB=1` (+ `VICTORY_CARD_BUFFERS_MB=1536`) | 2 | buffers shaders write compared on the card from 1 MiB |
 | `VICTORY_WIDE_BACK_MERGE=1` | 2 | shader-write merges on the kept threads |
 | `VICTORY_CARD_WIDE_HASH=1` | 5 | card compares: 64 threads a piece instead of one |
-| `VICTORY_INDIRECT_ONE_WAIT=1` | 5 | one shader-write drain per bounded indirect command, not two |
+| `VICTORY_INDIRECT_ONE_WAIT=1` | 5 | one shader-write drain per bounded indirect command, not two. **Hung the card (0x887A0006) 40 s into the world on the RX 9060 XT (2026-11-25, bounded indirect commands in flight): keep off** |
 | `VICTORY_CARD_STAMPS=1` | — | our own card work on the card's clock (log only) |
 | always on | 4 | shared locks: view table, made slots, buffer map; one host-copy lookup per state change; no per-draw Vec in `bind`; capture ops free without a capture; cached heap GPU handle; drop reasons counted in atomics; pipelines known by pointer |
 

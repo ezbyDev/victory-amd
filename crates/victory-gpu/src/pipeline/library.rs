@@ -582,28 +582,33 @@ static LAST_SAVE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 /// last save and `SAVE_EVERY` has passed (or `now`). Without `now` it gives
 /// way to a save under way; with `now` it waits for it, then saves what
 /// was added since.
-pub(crate) fn save(now: bool) {
+///
+/// Whether the library on disk now holds what was added: false only when a
+/// save was wanted and failed (the host device gone, the disk refusing).
+/// It said "saved" at a failure of the host GPU whose save had been
+/// refused for a removed device, the run's pipelines lost.
+pub(crate) fn save(now: bool) -> bool {
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return true };
     let _one = if now {
         SAVE_FILE.lock().unwrap_or_else(|e| e.into_inner())
     } else {
         match SAVE_FILE.try_lock() {
             Ok(held) => held,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::WouldBlock) => return true,
         }
     };
     {
         let mut last = LAST_SAVE.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+            return true;
         }
         *last = Some(std::time::Instant::now());
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
-        return;
+        return false;
     }
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
@@ -616,7 +621,7 @@ pub(crate) fn save(now: bool) {
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
+            return true;
         }
         if added == 0 {
             0
@@ -627,7 +632,7 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
-                return;
+                return false;
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
@@ -653,15 +658,21 @@ pub(crate) fn save(now: bool) {
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
-        Ok(()) => tracing::info!(
-            bytes,
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Ok(()) => {
+            tracing::info!(
+                bytes,
+                early = used.len(),
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                "host pipeline library saved"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "host pipeline library not saved");
+            false
+        }
     }
 }
 
@@ -736,10 +747,9 @@ pub(crate) fn save_within(limit: std::time::Duration) -> bool {
     }
     let (sent, done) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new().name("victory-pipeline-save-exit".into()).spawn(move || {
-        save(true);
-        let _ = sent.send(());
+        let _ = sent.send(save(true));
     });
-    spawned.is_ok() && done.recv_timeout(limit).is_ok()
+    spawned.is_ok() && done.recv_timeout(limit).unwrap_or(false)
 }
 
 /// Saves before the process ends on a panic or a closed console (its
