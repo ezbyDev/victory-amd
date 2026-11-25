@@ -934,7 +934,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // On the stack (a root signature holds at most 64 dwords):
+                // this was an allocation per stage of every draw.
+                let mut stack = [0u32; 64];
+                let mut spilled = Vec::new();
+                let values: &mut [u32] = if dwords as usize <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    spilled.resize(dwords as usize, 0);
+                    &mut spilled
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
